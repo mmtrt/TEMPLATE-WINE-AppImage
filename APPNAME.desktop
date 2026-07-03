@@ -1,0 +1,13 @@
+[Desktop Entry]
+Name=APPNAME
+GenericName=
+Comment=
+Type=Application
+Terminal=false
+Encoding=UTF-8
+Version=
+Icon=APPNAME
+Exec=APPNAME %F
+StartupWMClass=MAIN_EXE_HERE
+Categories=
+MimeType=

@@ -1,0 +1,55 @@
+#!/bin/sh
+# Thin launcher — MAIN_BIN called by AppRun after APPNAME.hook has already
+# set up the Wine/DXVK env and translated file args to Wine paths.
+#
+# Add extra `case` branches here for app-specific CLI flags that need
+# special handling (single-arg-only commands, flags that crash the app if
+# combined with file args, etc.) — see foobar2000's /playpause etc. or the
+# /? guard below for the general pattern.
+
+# DATADIR is exported by APPNAME.hook specifically so this separately
+# exec'd launcher can reconstruct the same $_APP_HOME path the hook uses
+# ($DATADIR/anylinux-wine/appname — XDG-compliant, grouped under one
+# namespace alongside other Wine apps rather than a dotfile in $HOME).
+progAppName="APPNAME_HERE"
+progHome="$DATADIR/anylinux-wine/$progAppName"
+progBin="MAIN_EXE_HERE"
+
+# If the hook's RUNTIME INSTALL flow is in use, RUN_EXE points at the
+# installed app and takes priority. Otherwise search the common locations
+# a build-time-extracted app or an installer-run app can end up in:
+#   1. $DATADIR/anylinux-wine/APPNAME_HERE/                                  (flat, foobar2000/npp style)
+#   2. $DATADIR/anylinux-wine/APPNAME_HERE/.wine/drive_c/Program Files/       (64-bit installer default)
+#   3. $DATADIR/anylinux-wine/APPNAME_HERE/.wine/drive_c/Program Files (x86)/ (32-bit installer default)
+#   4. $DATADIR/anylinux-wine/APPNAME_HERE/.wine/drive_c/<appname>/           (zip/tar/7z runtime-install
+#                                                                               target — see hook's
+#                                                                               _app_install_payload())
+# RUN_EXE only takes priority when the runtime-install flow is actually
+# enabled (INSTALL_URL set) — this avoids a stray/leaked RUN_EXE env var
+# silently overriding MAIN_EXE_HERE for apps using build-time extraction.
+# If you're using runtime install, both INSTALL_URL and RUN_EXE get patched
+# together by make-appimage.sh, so they're never set independently. Search
+# location 4 below is still checked as a fallback in case RUN_EXE wasn't
+# set correctly, or a build-time extraction happens to land there too.
+if [ -n "${RUN_EXE:-}" ] && [ -n "${INSTALL_URL:-}" ]; then
+        progBinPath="$RUN_EXE"
+else
+        progBinPath=""
+        for _candidate in \
+                "$progHome/$progBin" \
+                "$progHome/.wine/drive_c/Program Files"/*/"$progBin" \
+                "$progHome/.wine/drive_c/Program Files (x86)"/*/"$progBin" \
+                "$progHome/.wine/drive_c/$progAppName/$progBin"
+        do
+                if [ -f "$_candidate" ]; then
+                        progBinPath="$_candidate"
+                        break
+                fi
+        done
+        # Fall back to the flat path even if not found yet, so the error
+        # message on exec failure points at the expected default location.
+        [ -n "$progBinPath" ] || progBinPath="$progHome/$progBin"
+fi
+
+
+exec "$WINELOADER" "$progBinPath" "$@"
