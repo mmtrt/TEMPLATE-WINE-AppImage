@@ -3,16 +3,16 @@
 set -eu
 
 ARCH=$(uname -m)
-VERSION=APP_VERSION_HERE # example command to get version of application here
+VERSION=$(wget https://github.com/notepad-plus-plus/notepad-plus-plus/releases -qO - 2>&1 | grep -Eo ".*.x6" | grep npp | grep -Po "(\d+\.)+\d+" | head -n1) # example command to get version of application here
 export ARCH VERSION
 export OUTPATH=./dist
 export ADD_HOOKS="self-updater.hook"
 export UPINFO="gh-releases-zsync|${GITHUB_REPOSITORY%/*}|${GITHUB_REPOSITORY#*/}|latest|*$ARCH.AppImage.zsync"
-export APPNAME=APPNAME_HERE # change the application name here
+export APPNAME=Notepad++ # change the application name here
 # ICON must match whichever icon file you actually provide (.png or .svg) —
 # this template ships an APPNAME.svg placeholder; change the extension here
 # if you're using a PNG instead.
-export ICON="${APPNAME}.svg"
+export ICON="${APPNAME}.png"
 export DESKTOP="${APPNAME}.desktop"
 export DEPLOY_SDL=1
 export DEPLOY_PIPEWIRE=1
@@ -23,7 +23,7 @@ export DEPLOY_OPENGL=1
 # Used for StartupWMClass (window matching) regardless of which payload
 # strategy you use, and as the launcher's fallback search target when
 # RUN_EXE is not set.
-export MAIN_EXE=MAIN_EXE_HERE
+export MAIN_EXE=Notepad++
 
 # Runtime-install flow (optional — see README "Three ways to get your
 # app's payload in"). Set INSTALL_URL to a direct download link (.exe,
@@ -33,8 +33,8 @@ export MAIN_EXE=MAIN_EXE_HERE
 # must still name the correct .exe filename. Leave both empty/unset to use
 # build-time extraction instead (see the App payload examples below) —
 # this is the default and simplest path for most apps.
-INSTALL_URL=
-RUN_EXE=
+INSTALL_URL="AppDir/share/npp64.7z"
+RUN_EXE=C:\\Notepad++\\Notepad++.exe
 
 # Winetricks verbs your app needs to work at all (e.g. .NET, VC++
 # runtimes, specific fonts) — space-separated winetricks verb names. Runs
@@ -58,8 +58,8 @@ WINEPREFIX_SUBDIR=".wine"
 # Only for patching desktop file
 GENERIC_NAME="Wine Application" # example: Audio player
 COMMENT_NAME="Wine-packaged Windows application" # example: Simple and powerful audio player
-CATEGORIES_NAME="Utility;" # example: AudioVideo;Audio;Player;
-MIMETYPES_NAME="" # example: audio/aac;audio/x-mp3;
+CATEGORIES_NAME="Utility;TextEditor;" # example: AudioVideo;Audio;Player;
+MIMETYPES_NAME="text/plain;text/css;text/html;text/x-c++hdr;text/x-c++src;text/x-chdr;text/x-java;text/x-makefile;text/x-python;text/x-sh;application/x-wine-extension-ini;application/x-wine-extension-inf;" # example: audio/aac;audio/x-mp3;
 
 # Pick ONE of the two approaches below (or use RUNTIME INSTALL in the hook
 # instead — see README). Both examples use real, working URLs so you can
@@ -117,6 +117,8 @@ MIMETYPES_NAME="" # example: audio/aac;audio/x-mp3;
 # mkdir -p "AppDir/share"
 # cp "payload/MyApp-Setup.exe" "AppDir/share/MyApp-Setup.exe"
 # # Then in APPNAME.hook: INSTALL_URL="$APPDIR/share/MyApp-Setup.exe"
+mkdir -p "AppDir/share"
+wget -q "https://github.com/notepad-plus-plus/notepad-plus-plus/releases/download/v$VERSION/npp.$VERSION.portable.x64.7z" -O "AppDir/share/npp64.7z"
 
 # App hook + thin launcher
 # Copy and rename the template hook/launcher for your app, then patch in
