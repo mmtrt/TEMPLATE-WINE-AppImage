@@ -14,11 +14,6 @@ export APPNAME=APPNAME_HERE # change the application name here
 # if you're using a PNG instead.
 export ICON="${APPNAME}.svg"
 export DESKTOP="${APPNAME}.desktop"
-export DEPLOY_SDL=1
-export DEPLOY_PIPEWIRE=1
-export DEPLOY_GSTREAMER=1
-export DEPLOY_VULKAN=1
-export DEPLOY_OPENGL=1
 # MAIN_EXE is always required — the .exe filename identifying your app.
 # Used for StartupWMClass (window matching) regardless of which payload
 # strategy you use, and as the launcher's fallback search target when
@@ -54,6 +49,15 @@ WINEDEBUG="fixme-all"
 # you need a different subdir name (e.g. to match an existing installation's
 # layout, or to avoid a clash).
 WINEPREFIX_SUBDIR=".wine"
+
+# Prefer a shared pkgforge-dev/wine-AppImage over this app's own bundled
+# wine, if one is found on the host (via WINE_APPIMAGE_PATH or $PATH) at
+# runtime. Saves disk if the user has several Wine-based AppImages
+# installed — purely opportunistic, this AppImage still bundles its own
+# wine and works completely standalone if no shared copy is found. Set to
+# 1 to default this ON for your app; users can always override at runtime
+# via the USE_SHARED_WINE_APPIMAGE env var regardless of this default.
+USE_SHARED_WINE_APPIMAGE="0"
 
 # Only for patching desktop file
 GENERIC_NAME="Wine Application" # example: Audio player
@@ -173,6 +177,7 @@ sed -i "s|TRICKS_HERE|${TRICKS}|" "AppDir/bin/${APPNAME}.hook"
 sed -i "s|WINEDLLOVERRIDES_HERE|${WINEDLLOVERRIDES}|" "AppDir/bin/${APPNAME}.hook"
 sed -i "s|WINEDEBUG_HERE|${WINEDEBUG}|" "AppDir/bin/${APPNAME}.hook"
 sed -i "s|WINEPREFIX_SUBDIR_HERE|${WINEPREFIX_SUBDIR}|" "AppDir/bin/${APPNAME}.hook"
+sed -i "s|USE_SHARED_WINE_APPIMAGE_HERE|${USE_SHARED_WINE_APPIMAGE}|" "AppDir/bin/${APPNAME}.hook"
 # Convert the literal "AppDir" marker in INSTALL_URL to "$APPDIR"
 sed -i 's|INSTALL_URL:-AppDir/|INSTALL_URL:-$APPDIR/|' "AppDir/bin/${APPNAME}.hook"
 
@@ -189,82 +194,133 @@ sed -i "s|^Comment=.*|Comment=${COMMENT_NAME}|" "${APPNAME}.desktop"
 sed -i "s|^Categories=.*|Categories=${CATEGORIES_NAME}|" "${APPNAME}.desktop"
 sed -i "s|^MimeType=.*|MimeType=${MIMETYPES_NAME}|" "${APPNAME}.desktop"
 
-# Deploy dependencies
-mkdir -p /tmp/wine
-WINEPREFIX=/tmp/wine quick-sharun \
-	/usr/bin/wine*             \
-	/usr/lib/wine              \
-	/usr/bin/msidb             \
-	/usr/bin/msiexec           \
-	/usr/bin/notepad           \
-	/usr/bin/regedit           \
-	/usr/bin/regsvr32          \
-	/usr/bin/widl              \
-	/usr/bin/wmc               \
-	/usr/bin/wrc               \
-	/usr/bin/function_grep.pl  \
-	/usr/bin/cabextract        \
-	/usr/lib/libfreetype.so*   \
-	/usr/lib/libharfbuzz*      \
-	/usr/lib/libgraphite*      \
-	/usr/lib/libavcodec.so*    \
-	/usr/lib/libavdevice.so*   \
-	/usr/lib/libavfilter.so*   \
-	/usr/lib/libavformat.so*   \
-	/usr/lib/libavutil.so*     \
-	/usr/lib/libswresample.so* \
-	/usr/lib/libswscale.so*    \
-	/usr/bin/wget              \
-	/usr/bin/zenity            \
-	/usr/bin/unzip             \
-	/usr/lib/7zip/7z           \
-	/usr/lib/7zip/7z.so
+# REQUIRE_SHARED_WINE_APPIMAGE=1 skips bundling wine entirely — this
+# AppImage becomes much smaller but HARD REQUIRES a shared
+# pkgforge-dev/wine-AppImage to be present at runtime (via
+# WINE_APPIMAGE_PATH or $PATH); there is no standalone fallback. Only
+# set this if you're intentionally trading standalone portability for
+# a smaller download/disk footprint, e.g. distributing several apps from
+# this template together and expecting users to install wine-AppImage
+# once alongside them. When this is 1, USE_SHARED_WINE_APPIMAGE in
+# APPNAME.hook is forced on regardless of its own setting, since there's
+# no bundled wine to fall back to.
+#
+# Leave at 0 (default) for a fully standalone AppImage — this bundles
+# wine + winetricks + codec libs like every app built from this template
+# has so far, and USE_SHARED_WINE_APPIMAGE (set separately, see above)
+# only PREFERS the shared copy at runtime when both are available,
+# falling back to the bundled copy transparently if not found.
+REQUIRE_SHARED_WINE_APPIMAGE="0"
 
-# Install latest winetricks
-wget --retry-connrefused --tries=30 https://raw.githubusercontent.com/Winetricks/winetricks/master/src/winetricks -O ./AppDir/bin/winetricks
-chmod +x ./AppDir/bin/winetricks
+# anylinux.so gets patchelf'd onto our BUNDLED libc.so.6 later, inside
+# the wine-specific block below — that patched libc only exists when
+# wine is actually bundled. With REQUIRE_SHARED_WINE_APPIMAGE=1 there's
+# nothing for anylinux.so to attach to in this AppDir at all, so disable
+# it before quick-sharun's very first call (the generic-deps one right
+# below), not just before the later wine-specific one.
+if [ "$REQUIRE_SHARED_WINE_APPIMAGE" = 1 ]; then
+	export ANYLINUX_LIB="0"
 
-# alright here the pain starts
-ln -sr ./AppDir/lib/wine/x86_64-unix/*.so* ./AppDir/bin
-
-# this gets broken by sharun somehow
-kek=.$(tr -dc 'A-Za-z0-9_=-' < /dev/urandom | head -c 10)
-rm -f ./AppDir/lib/wine/x86_64-unix/wine
-cp /usr/lib/wine/x86_64-unix/wine ./AppDir/lib/wine/x86_64-unix/wine
-patchelf --set-interpreter /tmp/"$kek" ./AppDir/lib/wine/x86_64-unix/wine
-# we used to run patchelf --add-needed anylinux.so on the wine binary
-# but after 11.8 this causes the binary to break horribly:
-# AppDir/lib/wine/x86_64-unix/wine: oops... not enough space for load commands
-# so we will ahve to make sure anylinux.so loads by adding it as a dependency to the libc
-patchelf --add-needed anylinux.so ./AppDir/shared/lib/libc.so.6
-
-cat <<EOF > ./AppDir/bin/random-linker.src.hook
-#!/bin/sh
-cp -f "\$APPDIR"/shared/lib/ld-linux*.so* /tmp/"$kek"
-EOF
-chmod +x ./AppDir/bin/*.hook
-
-# Set the lib path to also use wine libs
-# shellcheck disable=SC2016
-echo 'LD_LIBRARY_PATH=${APPDIR}/lib:${APPDIR}/lib/pulseaudio:${APPDIR}/lib/alsa-lib:${APPDIR}/lib/wine/x86_64-unix' >> ./AppDir/.env
-
-# remove wine static libs
-find ./AppDir/lib/ -type f -name '*.a'
-find ./AppDir/lib/ -type f -name '*.a' -delete
-
-# strip windows libs, inspired by alpine linux: 
-# https://gitlab.alpinelinux.org/alpine/aports/-/blob/master/community/wine/APKBUILD
-if [ "$ARCH" = 'x86_64' ]; then
-	x86_64-w64-mingw32-strip -R .comment --strip-unneeded ./AppDir/lib/wine/x86_64-windows/*.dll
-	i686-w64-mingw32-strip   -R .comment --strip-unneeded ./AppDir/lib/wine/i386-windows/*.dll
+	# Deploy generic runtime-install/tooling dependencies — always needed
+	# regardless of whether wine itself is bundled.
+	quick-sharun /usr/bin/zenity
 fi
 
-# Disable FileOpenAssociations
-sed -i 's|    LicenseInformation|    LicenseInformation,\\\n    FileOpenAssociations|g;$a \\n[FileOpenAssociations]\nHKCU,Software\\Wine\\FileOpenAssociations,"Enable",,"N"' AppDir/share/wine/wine.inf
+if [ "$REQUIRE_SHARED_WINE_APPIMAGE" != 1 ]; then
+	export DEPLOY_SDL=1
+	export DEPLOY_PIPEWIRE=1
+	export DEPLOY_GSTREAMER=1
+	export DEPLOY_VULKAN=1
+	export DEPLOY_OPENGL=1
 
-# Disable winemenubuilder
-sed -i 's|    FileOpenAssociations|    FileOpenAssociations,\\\n    DllOverrides|;$a \\n[DllOverrides]\nHKCU,Software\\Wine\\DllOverrides,"*winemenubuilder.exe",,""' AppDir/share/wine/wine.inf
-sed -i '/\%11\%\\winemenubuilder.exe -a -r/d' AppDir/share/wine/wine.inf
+	mkdir -p /tmp/wine
+	WINEPREFIX=/tmp/wine quick-sharun \
+		/usr/bin/wine*             \
+		/usr/lib/wine              \
+		/usr/bin/msidb             \
+		/usr/bin/msiexec           \
+		/usr/bin/notepad           \
+		/usr/bin/regedit           \
+		/usr/bin/regsvr32          \
+		/usr/bin/widl              \
+		/usr/bin/wmc               \
+		/usr/bin/wrc               \
+		/usr/bin/function_grep.pl  \
+		/usr/bin/cabextract        \
+		/usr/lib/libfreetype.so*   \
+		/usr/lib/libharfbuzz*      \
+		/usr/lib/libgraphite*      \
+		/usr/lib/libavcodec.so*    \
+		/usr/lib/libavdevice.so*   \
+		/usr/lib/libavfilter.so*   \
+		/usr/lib/libavformat.so*   \
+		/usr/lib/libavutil.so*     \
+		/usr/lib/libswresample.so* \
+		/usr/lib/libswscale.so*    \
+		/usr/bin/wget              \
+		/usr/bin/zenity            \
+		/usr/bin/unzip             \
+		/usr/lib/7zip/7z           \
+		/usr/lib/7zip/7z.so
+
+	# Install latest winetricks — bundled version, used when
+	# USE_SHARED_WINE_APPIMAGE prefers the shared copy's winetricks but
+	# it isn't found, or when USE_SHARED_WINE_APPIMAGE is off entirely.
+	wget --retry-connrefused --tries=30 https://raw.githubusercontent.com/Winetricks/winetricks/master/src/winetricks -O ./AppDir/bin/winetricks
+	chmod +x ./AppDir/bin/winetricks
+
+	# alright here the pain starts
+	ln -sr ./AppDir/lib/wine/x86_64-unix/*.so* ./AppDir/bin
+
+	# this gets broken by sharun somehow
+	kek=.$(tr -dc 'A-Za-z0-9_=-' < /dev/urandom | head -c 10)
+	rm -f ./AppDir/lib/wine/x86_64-unix/wine
+	cp /usr/lib/wine/x86_64-unix/wine ./AppDir/lib/wine/x86_64-unix/wine
+	patchelf --set-interpreter /tmp/"$kek" ./AppDir/lib/wine/x86_64-unix/wine
+	# we used to run patchelf --add-needed anylinux.so on the wine binary
+	# but after 11.8 this causes the binary to break horribly:
+	# AppDir/lib/wine/x86_64-unix/wine: oops... not enough space for load commands
+	# so we will ahve to make sure anylinux.so loads by adding it as a dependency to the libc
+	patchelf --add-needed anylinux.so ./AppDir/shared/lib/libc.so.6
+
+	cat <<HOOKEOF > ./AppDir/bin/random-linker.src.hook
+#!/bin/sh
+cp -f "\$APPDIR"/shared/lib/ld-linux*.so* /tmp/"$kek"
+HOOKEOF
+	chmod +x ./AppDir/bin/*.hook
+
+	# Set the lib path to also use wine libs
+	# shellcheck disable=SC2016
+	echo 'LD_LIBRARY_PATH=${APPDIR}/lib:${APPDIR}/lib/pulseaudio:${APPDIR}/lib/alsa-lib:${APPDIR}/lib/wine/x86_64-unix' >> ./AppDir/.env
+
+	# remove wine static libs
+	find ./AppDir/lib/ -type f -name '*.a'
+	find ./AppDir/lib/ -type f -name '*.a' -delete
+
+	# strip windows libs, inspired by alpine linux:
+	# https://gitlab.alpinelinux.org/alpine/aports/-/blob/master/community/wine/APKBUILD
+	if [ "$ARCH" = 'x86_64' ]; then
+		x86_64-w64-mingw32-strip -R .comment --strip-unneeded ./AppDir/lib/wine/x86_64-windows/*.dll
+		i686-w64-mingw32-strip   -R .comment --strip-unneeded ./AppDir/lib/wine/i386-windows/*.dll
+	fi
+
+	# Disable FileOpenAssociations
+	sed -i 's|    LicenseInformation|    LicenseInformation,\\\n    FileOpenAssociations|g;$a \\n[FileOpenAssociations]\nHKCU,Software\\Wine\\FileOpenAssociations,"Enable",,"N"' AppDir/share/wine/wine.inf
+
+	# Disable winemenubuilder
+	sed -i 's|    FileOpenAssociations|    FileOpenAssociations,\\\n    DllOverrides|;$a \\n[DllOverrides]\nHKCU,Software\\Wine\\DllOverrides,"*winemenubuilder.exe",,""' AppDir/share/wine/wine.inf
+	sed -i '/\%11\%\\winemenubuilder.exe -a -r/d' AppDir/share/wine/wine.inf
+else
+	echo "REQUIRE_SHARED_WINE_APPIMAGE=1 — skipping bundled wine deployment." >&2
+	echo "This AppImage will require pkgforge-dev/wine-AppImage on the host at runtime." >&2
+	# random-linker.src.hook only exists to service a bundled, patched
+	# wine binary — with none bundled, APPNAME.hook's inline sourcing of
+	# it (guarded by [ -f ... ]) correctly no-ops.
+fi
+
+# Patch REQUIRE_SHARED_WINE_APPIMAGE into the hook so it can force
+# USE_SHARED_WINE_APPIMAGE on when no bundled wine exists to fall back to.
+sed -i "s|REQUIRE_SHARED_WINE_APPIMAGE_HERE|${REQUIRE_SHARED_WINE_APPIMAGE}|" "AppDir/bin/${APPNAME}.hook"
 
 # Turn AppDir into AppImage
 quick-sharun --make-appimage
