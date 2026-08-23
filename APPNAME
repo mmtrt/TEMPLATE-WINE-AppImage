@@ -9,19 +9,18 @@
 
 # DATADIR is exported by APPNAME.hook specifically so this separately
 # exec'd launcher can reconstruct the same $_APP_HOME path the hook uses
-# ($DATADIR/anylinux-wine/appname — XDG-compliant, grouped under one
-# namespace alongside other Wine apps rather than a dotfile in $HOME).
+# ($DATADIR/wine-appimage/apps/APPNAME — under the shared wine-appimage tree).
 progAppName="APPNAME_HERE"
-progHome="$DATADIR/anylinux-wine/$progAppName"
+progHome="$DATADIR/wine-appimage/apps/$progAppName"
 progBin="MAIN_EXE_HERE"
 
 # If the hook's RUNTIME INSTALL flow is in use, RUN_EXE points at the
 # installed app and takes priority. Otherwise search the common locations
 # a build-time-extracted app or an installer-run app can end up in:
-#   1. $DATADIR/anylinux-wine/APPNAME_HERE/                                  (flat, foobar2000/npp style)
-#   2. $DATADIR/anylinux-wine/APPNAME_HERE/.wine/drive_c/Program Files/       (64-bit installer default)
-#   3. $DATADIR/anylinux-wine/APPNAME_HERE/.wine/drive_c/Program Files (x86)/ (32-bit installer default)
-#   4. $DATADIR/anylinux-wine/APPNAME_HERE/.wine/drive_c/<appname>/           (zip/tar/7z runtime-install
+#   1. $DATADIR/wine-appimage/apps/APPNAME/                                  (flat, foobar2000/npp style)
+#   2. …/apps/APPNAME/.wine/drive_c/Program Files/                          (64-bit installer default)
+#   3. …/apps/APPNAME/.wine/drive_c/Program Files (x86)/                    (32-bit installer default)
+#   4. …/apps/APPNAME/.wine/drive_c/<appname>/                              (zip/tar/7z runtime-install
 #                                                                               target — see hook's
 #                                                                               _app_install_payload())
 # RUN_EXE only takes priority when the runtime-install flow is actually
@@ -52,4 +51,5 @@ else
 fi
 
 
-exec "$WINELOADER" "$progBinPath" "$@"
+# DISABLE_AUTO_UPDATES only for the shared wine-AppImage child process.
+DISABLE_AUTO_UPDATES=1 exec "$WINELOADER" "$progBinPath" "$@"

@@ -1,269 +1,85 @@
 #!/bin/sh
 
 # APPNAME hook — sourced by AppRun via AppRun.lib
-# Sets up WINE/DXVK environment, syncs app data dir, handles
-# install/remove dispatch, and translates file args to Wine paths.
+# Assumes get-wine-appimage.hook has already ensured wine is available
+# and added $DATADIR/wine-appimage/bin to PATH.
 #
-# Replace APPNAME_HERE / MAIN_EXE_HERE placeholders (done automatically by
-# make-appimage.sh's sed patches), and adjust _app_install's desktop entry.
+# Layout: $DATADIR/wine-appimage/{bin,apps/APPNAME,wine-*.AppImage,.target}
+#
+# Replace APPNAME_HERE / MAIN_EXE_HERE / VERSION_HERE placeholders via
+# make-appimage.sh's sed patches.
 #
 # Available from AppRun.lib: notify, download, is_cmd, APPDIR,
 # DATADIR, CACHEDIR, HOST_HOME, APPIMAGE_ARCH, HOSTPATH
 
-# When APPRUN_DEBUG=1, fd 3 duplicates stderr so genuine Wine/tool errors
-# are visible; otherwise fd 3 points at /dev/null so routine noise stays
-# quiet. Every command below that would otherwise hardcode 2>/dev/null
-# uses 2>&3 instead, so APPRUN_DEBUG=1 ./MyApp.AppImage shows real errors
-# without needing to edit this hook.
 if [ "$APPRUN_DEBUG" = 1 ]; then
-        exec 3>&2
+	exec 3>&2
 else
-        exec 3>/dev/null
+	exec 3>/dev/null
 fi
 
 # APP
 _APP_NAME="APPNAME_HERE"
-_APP_VER=
+_APP_VER="VERSION_HERE"
 _APP_REAL="$APPDIR/share/$_APP_NAME"
-_APP_HOME="$DATADIR/anylinux-wine/$_APP_NAME"
-# DATADIR isn't exported by AppRun.lib (only visible within AppRun's own
-# sourcing chain, which includes this hook) — export it so the separately
-# exec'd thin launcher can reconstruct the identical $_APP_HOME path.
+_APP_HOME="$DATADIR/wine-appimage/apps/$_APP_NAME"
 export DATADIR
 _APP_BIN="MAIN_EXE_HERE"
 _APP_ICOD="$DATADIR/applications/$_APP_NAME.desktop"
 _APP_ICON_FIX="$DATADIR/applications/fix_icon_wine_$_APP_NAME.desktop"
 
-# WINE
-# ─── Shared wine-AppImage detection (optional, saves disk across apps) ────
-# pkgforge-dev/wine-AppImage publishes a standalone, releasable AppImage
-# bundling wine + winetricks (~140MB), with its own AppRun dispatching
-# subcommands by matching $1 against files in ITS internal AppDir/bin —
-# e.g. `wine.AppImage wineserver -w`, `wine.AppImage regedit file.reg`,
-# `wine.AppImage winepath -w path`, `wine.AppImage winetricks verb` all
-# dispatch correctly to the matching internal tool, exactly like invoking
-# that tool directly. This means our own WINE/WINESERVER/WINELOADER (and
-# winetricks calls further below) can point AT that external AppImage
-# instead of our bundled copy, and every existing call site keeps working
-# unchanged — WINEPREFIX is honored identically either way.
-#
-# Set USE_SHARED_WINE_APPIMAGE=1 to opt in, OR just set WINE_APPIMAGE_PATH
-# directly — pointing at a specific external AppImage is a strong enough
-# signal of intent on its own, requiring a second flag on top of it is
-# just friction. If neither is set, we still AUTO-DISCOVER a shared
-# wine.AppImage by searching common install locations (below) for files
-# matching wine-*.AppImage — no manual configuration needed for the
-# common case. If multiple matching files are found (different versions,
-# or the same version in different locations), the highest version wins,
-# compared numerically (sort -V) rather than lexically, so e.g. 11.9
-# correctly sorts below 11.10.
-#
-# If nothing is found anywhere, we fall back to the bundled wine below —
-# opportunistic disk savings, not a hard dependency — UNLESS
-# make-appimage.sh built this AppImage with REQUIRE_SHARED_WINE_APPIMAGE=1
-# (no wine bundled at all), in which case USE_SHARED_WINE_APPIMAGE is
-# forced on and a missing shared AppImage is a hard error, since there is
-# no bundled fallback to use instead.
-_APP_REQUIRE_SHARED_WINE="REQUIRE_SHARED_WINE_APPIMAGE_HERE"
-USE_SHARED_WINE_APPIMAGE="${USE_SHARED_WINE_APPIMAGE:-USE_SHARED_WINE_APPIMAGE_HERE}"
-[ "$_APP_REQUIRE_SHARED_WINE" = 1 ] && USE_SHARED_WINE_APPIMAGE=1
-[ -n "${WINE_APPIMAGE_PATH:-}" ] && USE_SHARED_WINE_APPIMAGE=1
-
-# Auto-discover a wine-*-anylinux-*.AppImage across common install
-# locations, if WINE_APPIMAGE_PATH wasn't set explicitly. "anylinux" is
-# REQUIRED in the match — it's the actual marker confirming this is a
-# genuine pkgforge-dev/wine-AppImage build, not just any file that
-# happens to start with "wine-" (e.g. an unrelated "wine-notes.AppImage"
-# someone has sitting in ~/Downloads). Matches the actual naming scheme:
-#   wine-<version>-<build>-anylinux-<arch>.AppImage   (e.g. 11.13-1 — no
-#                                                       channel prefix,
-#                                                       this is the Arch
-#                                                       `wine` package
-#                                                       anylinux itself
-#                                                       is built on)
-#   wine-<channel>-<version>-anylinux-<arch>.AppImage  (stable/devel/staging)
-#   wine-<channel>_<version>-anylinux-<arch>.AppImage
-# Channel and version are extracted as SEPARATE fields (not compared as
-# one combined string) so version ranks numerically WITHIN a channel via
-# sort -V, and — when multiple different variants are present — priority
-# picks the preferred one first: plain versioned Arch builds rank
-# HIGHEST (anylinux is Arch-based, so this is the native match), then
-# stable > staging > devel (the conventional Wine release-maturity
-# order for the separately-channeled builds), rather than comparing
-# "11.13-1" against "stable-11.13" against "devel-11.14" as arbitrary
-# strings (which produces a meaningless result, since channel names and
-# version numbers don't share an ordering). Silent if nothing found —
-# this is a best-effort convenience, not a hard requirement (unless
-# REQUIRE_SHARED_WINE_APPIMAGE=1, checked separately below).
-_app_find_wine_appimage() {
-        _app_wine_candidates=""
-        for _app_search_dir in \
-                "$HOME/Applications" \
-                "$HOME/.local/bin" \
-                "$HOME/.local/share/applications" \
-                "$HOME/Downloads" \
-                "${XDG_DATA_HOME:-"$HOME/.local/share"}/soar/bin" \
-                "$HOME"
-        do
-                [ -d "$_app_search_dir" ] || continue
-                for _app_candidate in "$_app_search_dir"/wine-*-anylinux-*.AppImage; do
-                        if [ ! -f "$_app_candidate" ] || [ ! -x "$_app_candidate" ]; then
-                                continue
-                        fi
-                        _app_wine_candidates="$_app_wine_candidates
-$_app_candidate"
-                done
-        done
-        [ -n "$_app_wine_candidates" ] || return 1
-
-        # For each candidate: normalize the channel/version separator to a
-        # single "-" (the underscore variant becomes hyphenated too), split
-        # into channel + version, assign a numeric channel priority, and
-        # emit "priority\tversion\tpath" so we can sort by priority first,
-        # then version numerically within the winning priority tier.
-        #
-        # Priority order: plain versioned builds (no channel prefix at
-        # all, e.g. wine-11.13-1-anylinux-x86_64.AppImage — this is the
-        # Arch `wine` package itself, which is what anylinux is built on,
-        # so it's preferred over the separately-channeled builds) rank
-        # HIGHEST, then stable > staging > devel > unrecognized.
-        printf '%s\n' "$_app_wine_candidates" | while IFS= read -r _app_candidate; do
-                [ -n "$_app_candidate" ] || continue
-                _app_bn="$(basename "$_app_candidate")"
-                _app_field=$(printf '%s' "$_app_bn" | sed -n 's/^wine-\(.*\)-anylinux-.*/\1/p')
-                _app_field=$(printf '%s' "$_app_field" | sed 's/_/-/')
-                _app_first_seg="${_app_field%%-*}"
-                case "$_app_first_seg" in
-                        stable)  _app_prio=3; _app_ver="${_app_field#*-}" ;;
-                        staging) _app_prio=2; _app_ver="${_app_field#*-}" ;;
-                        devel)   _app_prio=1; _app_ver="${_app_field#*-}" ;;
-                        [0-9]*)
-                                # No channel word — the whole field IS the
-                                # version (plain Arch-based build).
-                                _app_prio=4
-                                _app_ver="$_app_field"
-                                ;;
-                        *)
-                                # Unrecognized non-numeric first segment —
-                                # treat conservatively as lowest priority,
-                                # whole field as the version for tie-breaking.
-                                _app_prio=0
-                                _app_ver="$_app_field"
-                                ;;
-                esac
-                [ -n "$_app_ver" ] || _app_ver="0"
-                printf '%s\t%s\t%s\n' "$_app_prio" "$_app_ver" "$_app_candidate"
-        done | sort -t "$(printf '\t')" -k1,1nr -k2,2Vr | head -n1 | cut -f3-
-}
-
-_app_wine_bin="$APPDIR/bin/wine"
-if [ "$USE_SHARED_WINE_APPIMAGE" = 1 ]; then
-        if [ -n "${WINE_APPIMAGE_PATH:-}" ] && [ -x "$WINE_APPIMAGE_PATH" ]; then
-                _app_wine_bin="$WINE_APPIMAGE_PATH"
-        elif _app_shared_wine="$(command -v wine.AppImage 2>&3)" && [ -x "$_app_shared_wine" ]; then
-                _app_wine_bin="$_app_shared_wine"
-        elif _app_shared_wine="$(_app_find_wine_appimage 2>&3)" && [ -n "$_app_shared_wine" ] && [ -x "$_app_shared_wine" ]; then
-                _app_wine_bin="$_app_shared_wine"
-        elif [ "$_APP_REQUIRE_SHARED_WINE" = 1 ]; then
-                echo "ERROR: This AppImage requires pkgforge-dev/wine-AppImage on the" >&2
-                echo "host (no wine is bundled) but none was found via WINE_APPIMAGE_PATH," >&2
-                echo "\$PATH, or common install locations (~/Applications,"  >&2
-                echo "\$HOME/.local/bin, \$HOME/Downloads, etc). Install wine-AppImage, or set" >&2
-                echo "WINE_APPIMAGE_PATH to point at it directly:" >&2
-                echo "https://github.com/pkgforge-dev/wine-AppImage" >&2
-                exit 1
-        fi
-        unset _app_shared_wine
+# WINE — prefer the real wine-AppImage path (not the shell wrappers in
+# wine-appimage/bin/). Winetricks uses `file` on $WINE / wineserver and
+# reports "Unknown file arch" if those are the .run scripts.
+_WINE_TOOLS_DIR="${DATADIR}/wine-appimage/bin"
+if [ -n "${WINE_APPIMAGE_PATH:-}" ] && [ -x "$WINE_APPIMAGE_PATH" ]; then
+	_app_wine_bin="$WINE_APPIMAGE_PATH"
+elif [ -x "$_WINE_TOOLS_DIR/wine" ]; then
+	_app_wine_bin="$_WINE_TOOLS_DIR/wine"
+elif command -v wine >/dev/null 2>&1; then
+	_app_wine_bin=$(command -v wine)
+else
+	echo "ERROR: No wine-AppImage found. Ensure get-wine-appimage.hook" >&2
+	echo "is present, or install pkgforge-dev/wine-AppImage manually:" >&2
+	echo "https://github.com/pkgforge-dev/wine-AppImage" >&2
+	exit 1
 fi
 export WINE="$_app_wine_bin"
 
-# Wine ignores $HOME directly, so --appimage-portable-home (which changes
-# $HOME for the whole AppRun session) would silently fail to isolate the
-# prefix unless WINEPREFIX is derived from something that tracks $HOME
-# too. $_APP_HOME is `$DATADIR/anylinux-wine/$_APP_NAME` — DATADIR is
-# itself derived from $HOME by AppRun.lib early in the sourcing sequence,
-# so it stays correctly isolated under portable-home automatically, same
-# as $HOME/.$_APP_NAME would have — just XDG-compliant instead of a
-# dotfile-in-home, and grouped with other Wine apps under one namespace.
-# The ".wine" subdir name is patchable from make-appimage.sh (WINEPREFIX_SUBDIR)
-# if you need a different name; defaults to ".wine" otherwise. Always
-# patched at build time with either the custom value or ".wine" — no
-# runtime placeholder comparison (see INSTALL_URL/RUN_EXE comment above for
-# why comparing against placeholder text is unsafe once sed has run).
 _APP_WINEPREFIX_SUBDIR="WINEPREFIX_SUBDIR_HERE"
 export WINEPREFIX="${WINEPREFIX:-"$_APP_HOME/$_APP_WINEPREFIX_SUBDIR"}"
-# WINEDLLOVERRIDES/WINEDEBUG defaults are patched from make-appimage.sh
-# (same place as VERSION/APPNAME/MAIN_EXE) if your app needs different
-# defaults than most Wine apps — e.g. WINEDLLOVERRIDES to disable a
-# specific DLL that misbehaves, or WINEDEBUG to trace a launch issue during
-# development. Both remain overridable at runtime via env regardless.
-# Always patched at build time with either the custom value or the sane
-# default shown in make-appimage.sh — no runtime placeholder comparison
-# (see INSTALL_URL/RUN_EXE comment above for why that's unsafe once sed
-# has run on the file).
 export WINEDLLOVERRIDES="${WINEDLLOVERRIDES:-"WINEDLLOVERRIDES_HERE"}"
 export WINEDEBUG="${WINEDEBUG:-"WINEDEBUG_HERE"}"
 
-# WINESERVER: in bundled mode point at the real wineserver binary. In shared
-# mode leave it unset so wine discovers the sibling bin/wineserver inside the
-# external AppImage mount (setting WINESERVER to the AppImage path would make
-# wine treat the AppImage as the wineserver binary itself and break IPC).
-# Setting it blindly to $_app_wine_bin also breaks bundled mode: $APPDIR/bin/wine
-# is a real binary, not a dispatcher, so "wine -w" tries to execute a Windows
-# program named "-w" and fails with "File not found."
-if [ "$USE_SHARED_WINE_APPIMAGE" = 1 ] && [ "$_app_wine_bin" != "$APPDIR/bin/wine" ]; then
-        unset WINESERVER          # shared: wine finds sibling bin/wineserver
-        export WINE_HOST_XDG_CACHE_HOME="$HOST_XDG_CACHE_HOME"
-        # Prevent AppImage-Cache/AppImage-Cache nesting when the shared
-        # wine AppImage's AppRun.lib rewrites XDG_CACHE_HOME again.
-        export XDG_CACHE_HOME="${HOST_XDG_CACHE_HOME:-${HOME}/.cache}"
-else
-        export WINESERVER="${WINESERVER:-"$APPDIR/bin/wineserver"}"  # bundled
-        unset WINE_HOST_XDG_CACHE_HOME
-fi
+# Shared AppImage: leave WINESERVER unset so wine finds sibling
+# bin/wineserver inside the mount.
+unset WINESERVER
+export WINE_HOST_XDG_CACHE_HOME="${HOST_XDG_CACHE_HOME:-${HOME}/.cache}"
+export XDG_CACHE_HOME="$WINE_HOST_XDG_CACHE_HOME"
 export WINELOADER="${WINELOADER:-"$_app_wine_bin"}"
+# Do not export DISABLE_AUTO_UPDATES here — that would disable this
+# consumer AppImage's self-updater. Set it only on the wine-AppImage exec.
 
-# ─── Wine tool subcommand interception ─────────────────────────────────────
-# AppRun dispatches $1 by checking if a file with that literal name exists
-# in OUR OWN AppDir/bin, BEFORE this hook has any further say in the
-# matter — e.g. `./MyApp.AppImage regedit foo.reg` finds our bundled
-# $APPDIR/bin/regedit and launches it directly, completely bypassing
-# _app_wine_bin above (which only affects the WINE/WINESERVER/WINELOADER
-# env vars, not AppRun's own TO_LAUNCH decision for $1 itself). This means
-# passing a wine tool name as $1 would silently ignore
-# USE_SHARED_WINE_APPIMAGE/WINE_APPIMAGE_PATH and always use our bundled
-# copy — or fail outright if REQUIRE_SHARED_WINE_APPIMAGE=1 left nothing
-# bundled at all.
-#
-# Intercept known wine tool subcommands here — after WINEPREFIX and the
-# other env vars above are already correctly set — and exit before AppRun
-# ever reaches its own dispatch. The invocation SHAPE differs depending on
-# what _app_wine_bin actually is:
-#   - shared wine.AppImage: it has its own internal AppRun that dispatches
-#     subcommands by matching $1 against ITS OWN AppDir/bin (confirmed —
-#     `wine.AppImage regedit foo.reg` works), so we pass the subcommand as
-#     an ARGUMENT: "$_app_wine_bin" "$_app_subcmd" "$@"
-#   - our own bundled wine ($APPDIR/bin/wine): this is a single real wine
-#     binary, NOT a dispatcher — it has no concept of "regedit"/"winetricks"
-#     as a first argument, it would just try to wine-execute a program
-#     literally named that (and fail, since no such .exe exists). Each
-#     tool is its OWN separate binary in $APPDIR/bin/, so we must exec
-#     THAT binary directly instead: "$APPDIR/bin/$_app_subcmd" "$@"
 case "$1" in
-        regedit|winecfg|wineconsole|winetricks|winefile|wineboot|wineserver|winepath|msiexec|notepad)
-                _app_subcmd="$1"
-                shift
-                if [ "$USE_SHARED_WINE_APPIMAGE" = 1 ] && [ "$_app_wine_bin" != "$APPDIR/bin/wine" ]; then
-                        exec "$_app_wine_bin" "$_app_subcmd" "$@"
-                elif [ -x "$APPDIR/bin/$_app_subcmd" ]; then
-                        exec "$APPDIR/bin/$_app_subcmd" "$@"
-                else
-                        echo "ERROR: '$_app_subcmd' not found — no shared wine.AppImage" >&2
-                        echo "in use and \$APPDIR/bin/$_app_subcmd doesn't exist in this" >&2
-                        echo "bundled build." >&2
-                        exit 1
-                fi
-                ;;
+	winetricks)
+		# Clear WINE/WINELOADER so winetricks uses the real ELF binaries
+		# from the wine-AppImage mount (PATH puts that bin/ first), not
+		# our outer shell wrappers. Drop any stale wineserver for this
+		# prefix first — otherwise winetricks' `wineserver -w` can hang
+		# forever waiting on orphaned processes from a previous run.
+		shift
+		_wai="${WINE_APPIMAGE_PATH:-$WINELOADER}"
+		DISABLE_AUTO_UPDATES=1 WINE= WINELOADER= \
+			"$_wai" wineserver -k >/dev/null 2>&1 || true
+		DISABLE_AUTO_UPDATES=1 WINE= WINELOADER= \
+			exec "$_wai" winetricks "$@"
+		;;
+	regedit|winecfg|wineconsole|winefile|wineboot|wineserver|winepath|msiexec|notepad)
+		_app_subcmd="$1"
+		shift
+		DISABLE_AUTO_UPDATES=1 \
+			exec "${WINE_APPIMAGE_PATH:-$WINELOADER}" "$_app_subcmd" "$@"
+		;;
 esac
 
 # DXVK
@@ -272,468 +88,315 @@ export DXVK_LOG_LEVEL="${DXVK_LOG_LEVEL:-"none"}"
 export DXVK_STATE_CACHE="${DXVK_STATE_CACHE:-"0"}"
 export DXVK_CONFIG_FILE="${DXVK_CONFIG_FILE:-"$_APP_HOME/dxvk.conf"}"
 
-# Ensure app home exists
-mkdir -p "$_APP_HOME" || exit 1
+# Filter Mesa EGL/DRI logs to fatal only
+export EGL_LOG_LEVEL="${EGL_LOG_LEVEL:-"fatal"}"
 
-# Sync bundled app data into $_APP_HOME — but only when actually needed
-# (first launch, or the bundled version changed since the last sync),
-# not on every single launch. `cp -urs` has to stat() every file in the
-# source tree to decide what's changed even when nothing has — on an
-# HDD this is genuinely expensive (each stat() can cost a real seek) and
-# was a measurable chunk of startup time when paid on every launch for
-# an app with many bundled files (plugins, localization, themes, etc).
-# A version marker lets us skip the whole stat() pass when nothing's
-# actually changed since we last synced.
+[ -d "$_APP_HOME" ] || mkdir -p "$_APP_HOME" || exit 1
+
 _app_synced_ver_file="$_APP_HOME/.synced-version"
 if [ -d "$_APP_REAL" ] && { [ ! -f "$_app_synced_ver_file" ] || [ "$(cat "$_app_synced_ver_file" 2>&3)" != "$_APP_VER" ]; }; then
-        if [ -n "$(ls -A "$_APP_REAL" 2>&3)" ]; then
-                # Delete broken symlinks, sync app data — || true guards
-                # against set -e from AppRun when the home or share dir is
-                # empty/missing on first run. stdout is always suppressed
-                # (nothing useful there); stderr goes to fd 3 so
-                # APPRUN_DEBUG=1 shows why these no-op on a fresh/empty
-                # source dir.
-                find -L "$_APP_HOME/" -maxdepth 2 -type l -delete >/dev/null 2>&3 || true
-                cp -urs "$_APP_REAL/"* "$_APP_HOME" >/dev/null 2>&3 || true
-        fi
-        echo "$_APP_VER" > "$_app_synced_ver_file" 2>&3 || true
+	if [ -n "$(ls -A "$_APP_REAL" 2>&3)" ]; then
+		# Only clean broken symlinks at depth 1 — never recurse into .wine
+		find -L "$_APP_HOME/" -maxdepth 1 -mindepth 1 -type l -delete >/dev/null 2>&3 || true
+		# First sync: hard copy so files survive AppImage unmount.
+		# Later version bumps: symlink (cp -urs) for space; broken links
+		# from a previous AppImage mount are cleaned above before re-sync.
+		if [ ! -f "$_app_synced_ver_file" ]; then
+			cp -r "$_APP_REAL/"* "$_APP_HOME" >/dev/null 2>&3 || true
+		else
+			cp -urs "$_APP_REAL/"* "$_APP_HOME" >/dev/null 2>&3 || true
+		fi
+	fi
+	echo "$_APP_VER" > "$_app_synced_ver_file" 2>&3 || true
 fi
 
-# Desktop integration
-_app_install() {
-    mkdir -p "$DATADIR/icons/hicolor/256x256/apps" "$DATADIR/icons/hicolor/scalable/apps" "$DATADIR/applications"
-    if [ -f "$APPDIR/$_APP_NAME.png" ]; then
-        cp -f "$APPDIR/$_APP_NAME.png" "$DATADIR/icons/hicolor/256x256/apps/" 2>&3 || true
-    elif [ -f "$APPDIR/$_APP_NAME.svg" ]; then
-        cp -f "$APPDIR/$_APP_NAME.svg" "$DATADIR/icons/hicolor/scalable/apps/" 2>&3 || true
-    fi
+_app_install_icons() {
+	mkdir -p "$DATADIR/icons/hicolor/256x256/apps" \
+		"$DATADIR/icons/hicolor/scalable/apps" \
+		"$DATADIR/applications"
+	if [ -f "$APPDIR/$_APP_NAME.png" ]; then
+		cp -f "$APPDIR/$_APP_NAME.png" "$DATADIR/icons/hicolor/256x256/apps/" 2>&3 || true
+	elif [ -f "$APPDIR/$_APP_NAME.svg" ]; then
+		cp -f "$APPDIR/$_APP_NAME.svg" "$DATADIR/icons/hicolor/scalable/apps/" 2>&3 || true
+	fi
+}
 
-    # Copy the pre-patched desktop entry from AppDir rather than generating
-    # a generic one — make-appimage.sh already patched it with the correct
-    # GenericName, Comment, Categories, etc.
-    if [ -f "$APPDIR/$_APP_NAME.desktop" ]; then
-        cp -f "$APPDIR/$_APP_NAME.desktop" "$_APP_ICOD" 2>&3 || true
-    fi
-    update-desktop-database -q 2>&3 || true
+_app_install() {
+	_app_install_icons
+	if [ -f "$APPDIR/$_APP_NAME.desktop" ]; then
+		cp -f "$APPDIR/$_APP_NAME.desktop" "$_APP_ICOD" 2>&3 || true
+	fi
+	update-desktop-database -q 2>&3 || true
 }
 
 _app_remove() {
-        rm -f "$DATADIR/applications/$_APP_NAME.desktop"
-        rm -f "$DATADIR/icons/hicolor/256x256/apps/$_APP_NAME.png"
-        rm -f "$DATADIR/icons/hicolor/scalable/apps/$_APP_NAME.svg"
+	rm -f "$DATADIR/applications/$_APP_NAME.desktop"
+	rm -f "$DATADIR/icons/hicolor/256x256/apps/$_APP_NAME.png"
+	rm -f "$DATADIR/icons/hicolor/scalable/apps/$_APP_NAME.svg"
 }
 
-# Intercept install/remove before AppRun reaches binary dispatch
 case "$1" in
-        install) _app_install; exit 0 ;;
-        remove)  _app_remove;  exit 0 ;;
+	install) _app_install; exit 0 ;;
+	remove)  _app_remove;  exit 0 ;;
 esac
 
-if [ "$USE_SHARED_WINE_APPIMAGE" = 1 ]; then
- if [ ! -f "$_APP_ICON_FIX" ]; then
-     mkdir -p "$DATADIR/icons/hicolor/256x256/apps" "$DATADIR/icons/hicolor/scalable/apps" "$DATADIR/applications"
-     if [ -f "$APPDIR/$_APP_NAME.png" ]; then
-         cp -f "$APPDIR/$_APP_NAME.png" "$DATADIR/icons/hicolor/256x256/apps/" 2>&3 || true
-     elif [ -f "$APPDIR/$_APP_NAME.svg" ]; then
-         cp -f "$APPDIR/$_APP_NAME.svg" "$DATADIR/icons/hicolor/scalable/apps/" 2>&3 || true
-     fi
-     cat > "$_APP_ICON_FIX" << EOF
+if [ ! -f "$_APP_ICON_FIX" ]; then
+	_app_install_icons
+	cat > "$_APP_ICON_FIX" << EOF
 [Desktop Entry]
 Name=$_APP_NAME
 Icon=$_APP_NAME
 NoDisplay=true
 StartupWMClass=$_APP_BIN
 EOF
-     update-desktop-database -q 2>&3 || true
- fi
-fi
-
-# Ensure the prefix is actually initialized before winetricks or a runtime
-# install touches it — first launch after a fresh/backed-up prefix needs
-# this explicitly rather than relying on it happening implicitly.
-#
-# AppRun sources *.hook files in plain alphabetical order. If make-appimage.sh
-# generates random-linker.src.hook to copy the real dynamic linker into place
-# before wine can run — but that hook's filename may sort AFTER this one
-# (e.g. "Notepad++.hook" < "random-linker.src.hook" since uppercase sorts
-# before lowercase in a plain byte-wise glob). Calling wineboot --init here
-# before that hook has run leaves wine's patched ELF interpreter pointing
-# at a /tmp path that doesn't exist yet, failing with
-# "/tmp/.XXXXXXXXXX: could not open" — regardless of what this app is named.
-# Run the same copy inline first, so we never depend on hook ordering.
-# random-linker.src.hook copies the patched ld-linux.so into /tmp so the
-# patchelf'd bundled wine binary can find its interpreter. Only needed when
-# we're actually using the bundled wine binary.
-if [ "$_app_wine_bin" = "$APPDIR/bin/wine" ] && [ -f "$APPDIR/bin/random-linker.src.hook" ]; then
-        # shellcheck source=/dev/null
-        . "$APPDIR/bin/random-linker.src.hook"
+	update-desktop-database -q 2>&3 || true
 fi
 
 _app_fresh_prefix=0
 if [ ! -f "$WINEPREFIX/system.reg" ]; then
-        "$WINELOADER" wineboot --init 2>&3
-        # The shared wine-AppImage dispatches subcommands by matching $1
-        # against files in its own AppDir/bin. "wine.AppImage -w" looks for
-        # AppDir/bin/-w (doesn't exist) and falls through to "wine -w",
-        # which fails. We must pass "wineserver" as the subcommand so the
-        # AppImage's internal dispatch routes it correctly.
-        if [ "$USE_SHARED_WINE_APPIMAGE" = 1 ] && [ "$_app_wine_bin" != "$APPDIR/bin/wine" ]; then
-                "$_app_wine_bin" wineserver -w 2>&3 || true
-        else
-                "$WINESERVER" -w 2>&3 || true
-        fi
-        _app_fresh_prefix=1
+	DISABLE_AUTO_UPDATES=1 "$WINELOADER" wineboot --init 2>&3
+	DISABLE_AUTO_UPDATES=1 "$WINELOADER" wineserver -w 2>&3 || true
+	_app_fresh_prefix=1
 fi
 
-# ─── Redirect %APPDATA%/%LOCALAPPDATA%/%USERPROFILE% to XDG paths ─────────
-# By default Wine keeps app data buried inside $WINEPREFIX/drive_c/users/...
-# which most backup tools and "reset my config" instructions won't think to
-# look at. Redirecting these registry entries to point at
-# $XDG_DATA_HOME/$_APP_NAME instead keeps the app's actual settings/save
-# data somewhere predictable and easy to back up or wipe independently of
-# the whole Wine prefix. Only needs to run once, right after a fresh prefix
-# is created — set REDIRECT_APPDATA=0 in APPNAME.hook to disable if your
-# app doesn't play well with this (rare, but some installers hardcode
-# drive_c paths and get confused).
+# AppData redirect: symlink each profile's AppData to
+# $DATADIR/wine-appimage/data/$APPNAME/AppData so settings survive prefix
+# resets and stay outside drive_c. Runs every launch (idempotent).
 REDIRECT_APPDATA="${REDIRECT_APPDATA:-1}"
-if [ "$REDIRECT_APPDATA" = 1 ] && [ "$_app_fresh_prefix" = 1 ]; then
-        # Deliberately NOT under anylinux-wine/ — this is the app's actual
-        # user-facing data (settings, saves), which should live where a
-        # native Linux port of the app would put it, not nested under a
-        # Wine-implementation-detail namespace. Contrast with $_APP_HOME
-        # above, which IS grouped under anylinux-wine/ since it's Wine
-        # plumbing (prefix, exe copy), not user data.
-        _app_xdg_data="$DATADIR/$_APP_NAME"
-        mkdir -p "$_app_xdg_data/AppData/Roaming" "$_app_xdg_data/AppData/Local"
-        _app_userprofile_win=$("$_app_wine_bin" winepath -w "$_app_xdg_data" 2>&3)
-        _app_appdata_win=$("$_app_wine_bin" winepath -w "$_app_xdg_data/AppData/Roaming" 2>&3)
-        _app_localappdata_win=$("$_app_wine_bin" winepath -w "$_app_xdg_data/AppData/Local" 2>&3)
-        if [ -n "$_app_userprofile_win" ]; then
-                # REGEDIT4 format requires backslashes in quoted string values to be
-                # escaped as \\ — winepath -w outputs single backslashes (e.g.
-                # C:\home\user\...), which regedit otherwise misreads as escape
-                # sequences like \h, \u, \s (hence "unrecognized registry sequence").
-                _app_userprofile_win=$(printf '%s' "$_app_userprofile_win" | sed 's/\\/\\\\/g')
-                _app_appdata_win=$(printf '%s' "$_app_appdata_win" | sed 's/\\/\\\\/g')
-                _app_localappdata_win=$(printf '%s' "$_app_localappdata_win" | sed 's/\\/\\\\/g')
-                # Scope the temp file to $_APP_NAME to avoid collisions when multiple
-                # app AppImages run simultaneously in the shared CACHEDIR.
-                cat > "$CACHEDIR/$_APP_NAME-appdata-redirect.reg" << EOF
-REGEDIT4
-
-[HKEY_CURRENT_USER\\Software\\Wine\\User\\Volatile Environment]
-"USERPROFILE"="$_app_userprofile_win"
-"APPDATA"="$_app_appdata_win"
-"LOCALAPPDATA"="$_app_localappdata_win"
-EOF
-                "$WINELOADER" regedit "$CACHEDIR/$_APP_NAME-appdata-redirect.reg" 2>&3 || true
-                rm -f "$CACHEDIR/$_APP_NAME-appdata-redirect.reg"
-        fi
+if [ "$REDIRECT_APPDATA" = 1 ]; then
+	_app_xdg_data="$DATADIR/wine-appimage/data/$_APP_NAME"
+	mkdir -p "$_app_xdg_data/AppData/Roaming" "$_app_xdg_data/AppData/Local"
+	if [ -d "$WINEPREFIX/drive_c/users" ]; then
+		for _uprofile in "$WINEPREFIX/drive_c/users"/*; do
+			[ -d "$_uprofile" ] || continue
+			case "$(basename "$_uprofile")" in
+				Public|Default*|All\ Users) continue ;;
+			esac
+			_appdata="$_uprofile/AppData"
+			if [ -L "$_appdata" ]; then
+				[ "$(readlink "$_appdata" 2>/dev/null || true)" = "$_app_xdg_data/AppData" ] && continue
+				rm -f "$_appdata"
+			elif [ -d "$_appdata" ]; then
+				# One-time copy of existing prefix AppData into the XDG tree
+				if [ ! -f "$_app_xdg_data/.migrated-from-prefix" ]; then
+					cp -a "$_appdata/." "$_app_xdg_data/AppData/" 2>&3 || true
+					: > "$_app_xdg_data/.migrated-from-prefix"
+				fi
+				rm -rf "$_appdata"
+			fi
+			ln -sfn "$_app_xdg_data/AppData" "$_appdata"
+		done
+	fi
 fi
 
-# ─── Winetricks verbs ───────────────────────────────────────────────────────
-# Some apps need specific Wine components installed to work at all — e.g.
-# .NET (dotnet48), Visual C++ runtimes (vcrun2019), DXVK, or specific fonts.
-# Set TRICKS in make-appimage.sh (same place as VERSION/APPNAME/MAIN_EXE) to
-# a space-separated list of winetricks verbs; they run once, right after a
-# fresh WINEPREFIX is created (before the app itself installs or launches).
-# Bundle winetricks in AppDir/bin via make-appimage.sh, or make-appimage.sh
-# can fetch it from upstream at build time — see the winetricks section there.
-#
-# Example (set in make-appimage.sh): TRICKS="dotnet48 vcrun2019 corefonts"
-# Always patched at build time with either the real verb list or an empty
-# string — no runtime placeholder comparison needed (see INSTALL_URL/RUN_EXE
-# comment above for why that pattern is unsafe once sed has run on the file).
 TRICKS="${TRICKS:-TRICKS_HERE}"
 
 if [ -n "$TRICKS" ] && [ ! -f "$WINEPREFIX/.tricks-applied" ]; then
-        # winetricks dispatches through the shared wine.AppImage the same
-        # way wineboot/regedit/winepath/wineserver do, when
-        # USE_SHARED_WINE_APPIMAGE resolved to it above — falls back to
-        # our own bundled copy of winetricks otherwise (make-appimage.sh
-        # fetches it fresh from upstream unless REQUIRE_SHARED_WINE_APPIMAGE=1,
-        # in which case there is no bundled copy and we rely entirely on
-        # the shared AppImage's own bundled winetricks).
-        #
-        # NOTE: this must never touch "$@" (positional params) — they
-        # hold this AppRun invocation's actual launch arguments (the file
-        # being opened, /add, etc.), still needed by the translation loop
-        # further below.
-        _app_winetricks_bin=""
-        _app_winetricks_prefix=""
-        if [ "$USE_SHARED_WINE_APPIMAGE" = 1 ] && [ "$_app_wine_bin" != "$APPDIR/bin/wine" ]; then
-                _app_winetricks_bin="$_app_wine_bin"
-                _app_winetricks_prefix="winetricks"
-        elif [ -x "$APPDIR/bin/winetricks" ]; then
-                _app_winetricks_bin="$APPDIR/bin/winetricks"
-        fi
-
-        if [ -n "$_app_winetricks_bin" ]; then
-                echo "Installing winetricks verbs: $TRICKS" 2>&3
-                IFS=' '
-                for _trick in $TRICKS; do
-                        unset IFS
-                        if [ -n "$_app_winetricks_prefix" ]; then
-                                "$_app_winetricks_bin" "$_app_winetricks_prefix" --unattended --force "$_trick" 2>&3 \
-                                        || echo "winetricks verb failed: $_trick" >&2
-                        else
-                                "$_app_winetricks_bin" --unattended --force "$_trick" 2>&3 \
-                                        || echo "winetricks verb failed: $_trick" >&2
-                        fi
-                done
-                unset IFS
-                touch "$WINEPREFIX/.tricks-applied"
-        else
-                echo "TRICKS set but no winetricks available (checked shared" >&2
-                echo "wine.AppImage and $APPDIR/bin/winetricks) — skipping" >&2
-        fi
+	echo "Installing winetricks verbs: $TRICKS" 2>&3
+	# Same rules as the `winetricks` subcommand: real AppImage path, clear
+	# WINE/WINELOADER so winetricks finds ELF binaries on the mount PATH.
+	# One wineserver -k before/after the batch (not per verb) — each kill
+	# starts the wine AppImage. No --force: reuse downloads and skip
+	# verbs already present in the prefix on retry.
+	_wai="${WINE_APPIMAGE_PATH:-$WINELOADER}"
+	DISABLE_AUTO_UPDATES=1 WINE= WINELOADER= \
+		"$_wai" wineserver -k >/dev/null 2>&3 || true
+	IFS=' '
+	_tricks_ok=1
+	for _trick in $TRICKS; do
+		unset IFS
+		if ! DISABLE_AUTO_UPDATES=1 WINE= WINELOADER= \
+			"$_wai" winetricks --unattended "$_trick" 2>&3; then
+			echo "winetricks verb failed: $_trick" >&2
+			_tricks_ok=0
+		fi
+	done
+	unset IFS
+	DISABLE_AUTO_UPDATES=1 WINE= WINELOADER= \
+		"$_wai" wineserver -k >/dev/null 2>&3 || true
+	# Only mark applied if every verb succeeded
+	if [ "$_tricks_ok" = 1 ]; then
+		touch "$WINEPREFIX/.tricks-applied"
+	fi
 fi
 
-# ─── RUNTIME INSTALL (optional alternative to build-time extraction) ──────
-# Use this instead of the "App home setup" block above when your app's
-# license doesn't permit redistributing an extracted/pre-installed copy —
-# e.g. the app must be downloaded and installed fresh on the user's machine.
-# Handles common Windows distribution formats: .zip/.tar.xz/.tar.gz/.7z
-# (portable archives, just unpacked — no Wine involved), .exe (NSIS/Inno/
-# generic installer, run silently under Wine), and .msi (run via msiexec).
-# Adapted from sommelier-core's install_app(), stripped of all snapd
-# content-plug logic since sharun/AppRun already handles library/runtime
-# provisioning.
-#
-# Set INSTALL_URL and RUN_EXE in make-appimage.sh (same place as VERSION/
-# APPNAME/MAIN_EXE) — it patches both placeholders below via sed, same
-# pattern as everything else in this hook. INSTALL_URL accepts either a
-# real URL (downloaded to CACHEDIR and deleted after install) or a local
-# path inside AppDir (see "Example D" bundled-payload pattern in
-# make-appimage.sh) for a fully offline-capable AppImage. Leave INSTALL_URL
-# unset in make-appimage.sh to disable this and fall back to the
-# build-time "App home setup" block above instead.
-#
-# RUN_EXE is a Windows-style path passed straight to wine, e.g.
-# 'C:\Program Files\MyApp\MyApp.exe'. Neither backslash count nor drive
-# letter case matter: writing "C:\\..." vs "C:\..." in make-appimage.sh's
-# shell source produces the same string either way (double-quoted shell
-# strings only treat \\ as an escaped single backslash), and "c:\..." vs
-# "C:\..." are equivalent to wine/winepath since DOS drive letters are
-# case-insensitive by spec.
-# make-appimage.sh always sed-patches the placeholder text below —
-# INSTALL_URL_HERE / RUN_EXE_HERE — with either a real value or an empty
-# string, decided at build time. No runtime "is this still a placeholder"
-# comparison is needed (an earlier version of this hook had one, but since
-# sed replaces every occurrence of a matched string in the file, having the
-# placeholder text appear a second time in a comparison caused sed to patch
-# that line too, making the comparison always true and silently resetting
-# the real value back to empty on every launch).
 export INSTALL_URL="${INSTALL_URL:-INSTALL_URL_HERE}"
 export RUN_EXE="${RUN_EXE:-RUN_EXE_HERE}"
+# Space-separated silent flags for .exe/.msi runtime install (patched by
+# make-appimage.sh). Empty → type-specific defaults in _app_install_payload.
+INSTALL_FLAGS="${INSTALL_FLAGS:-INSTALL_FLAGS_HERE}"
+
+# Case-insensitive existence (Linux FS vs Windows exe names)
+_app_ci_exists() {
+	_ci_dir=$(dirname "$1")
+	_ci_base=$(basename "$1")
+	[ -d "$_ci_dir" ] && [ -n "$(find "$_ci_dir" -maxdepth 1 -mindepth 1 -iname "$_ci_base" -print -quit 2>/dev/null)" ]
+}
 
 _app_install_payload() {
-        # Accepts either a URL (http/https) or a local path — a local path
-        # is used for the BUNDLED PAYLOAD variant below, where the installer/
-        # zip already ships inside AppDir and no download is needed.
-        _pkg_src="$1"
-        _pkg_is_local=0
+	_pkg_src="$1"
+	_pkg_is_local=0
+	_pkg_dest="$WINEPREFIX/drive_c/$_APP_NAME"
 
-        case "$_pkg_src" in
-                http://*|https://*)
-                        _pkg_file="$CACHEDIR/$(basename "${_pkg_src%%\?*}")"
-                        mkdir -p "$CACHEDIR"
-						# Resolution order: $APPDIR/bin, host $PATH, then shared
-						# wine.AppImage last. Not every wine-AppImage ships
-						# wget/7z/unzip/tar — preferring local tools avoids
-						# "wine 7z …" fallthrough when the tool is absent.
-                        _app_toolbin=""
-                        _app_toolsub=""
-                        if [ -x "$APPDIR/bin/wget" ]; then
-                                _app_toolbin="$APPDIR/bin/wget"
-                        elif command -v wget >/dev/null 2>&1; then
-                                _app_toolbin="wget"
-                        elif [ "$USE_SHARED_WINE_APPIMAGE" = 1 ] && [ "$_app_wine_bin" != "$APPDIR/bin/wine" ]; then
-                                _app_toolbin="$_app_wine_bin"
-                                _app_toolsub="wget"
-                        else
-                                echo "No wget found (checked $APPDIR/bin, \$PATH, and shared wine.AppImage) to download $_pkg_src" >&2
-                                return 1
-                        fi
-                        if [ -n "$_app_toolsub" ]; then
-                                "$_app_toolbin" "$_app_toolsub" -q "$_pkg_src" -O "$_pkg_file" \
-                                        || { echo "Download failed: $_pkg_src" >&2; return 1; }
-                        else
-                                "$_app_toolbin" -q "$_pkg_src" -O "$_pkg_file" \
-                                        || { echo "Download failed: $_pkg_src" >&2; return 1; }
-                        fi
-                        ;;
-                *)
-                        _pkg_file="$_pkg_src"
-                        _pkg_is_local=1
-                        [ -f "$_pkg_file" ] || { echo "Not found: $_pkg_file" >&2; return 1; }
-                        ;;
-        esac
+	case "$_pkg_src" in
+		http://*|https://*)
+			_pkg_file="$CACHEDIR/$(basename "${_pkg_src%%\?*}")"
+			[ -d "$CACHEDIR" ] || mkdir -p "$CACHEDIR"
+			# Reuse cached download when present (version bumps change URL/basename).
+			if [ ! -s "$_pkg_file" ]; then
+				if command -v wget >/dev/null 2>&1; then
+					wget -q "$_pkg_src" -O "$_pkg_file" \
+						|| { echo "Download failed: $_pkg_src" >&2; rm -f "$_pkg_file"; return 1; }
+				else
+					echo "No wget found to download $_pkg_src" >&2
+					return 1
+				fi
+			fi
+			;;
+		*)
+			_pkg_file="$_pkg_src"
+			_pkg_is_local=1
+			[ -f "$_pkg_file" ] || { echo "Not found: $_pkg_file" >&2; return 1; }
+			;;
+	esac
 
-        case "$_pkg_file" in
-                *.zip)
-                        # Portable app — just unpack into WINEPREFIX's drive_c,
-                        # no installer to run.
-                        #
-						# Resolution order: $APPDIR/bin, host $PATH, then shared
-						# wine.AppImage last. Binary path and subcommand are kept
-                        # as SEPARATE variables (not concatenated into one
-                        # string) so a space in the AppImage's own path
-                        # doesn't get word-split incorrectly.
-                        _app_toolbin=""
-                        _app_toolsub=""
-                        if [ -x "$APPDIR/bin/unzip" ]; then
-                                _app_toolbin="$APPDIR/bin/unzip"
-                        elif command -v unzip >/dev/null 2>&1; then
-                                _app_toolbin="unzip"
-                        elif [ "$USE_SHARED_WINE_APPIMAGE" = 1 ] && [ "$_app_wine_bin" != "$APPDIR/bin/wine" ]; then
-                                _app_toolbin="$_app_wine_bin"
-                                _app_toolsub="unzip"
-                        else
-                                echo "No unzip found (checked $APPDIR/bin, \$PATH, and shared wine.AppImage) to extract $_pkg_file" >&2
-                                return 1
-                        fi
-                        mkdir -p "$WINEPREFIX/drive_c/$_APP_NAME"
-                        if [ -n "$_app_toolsub" ]; then
-                                "$_app_toolbin" "$_app_toolsub" -q -o "$_pkg_file" -d "$WINEPREFIX/drive_c/$_APP_NAME" || return 1
-                        else
-                                "$_app_toolbin" -q -o "$_pkg_file" -d "$WINEPREFIX/drive_c/$_APP_NAME" || return 1
-                        fi
-                        ;;
-                *.tar.xz|*.txz)
-						# Resolution order: $APPDIR/bin, host $PATH, then shared
-						# wine.AppImage last (same as wget/unzip/7z).
-                        _app_toolbin=""
-                        _app_toolsub=""
-                        if [ -x "$APPDIR/bin/tar" ]; then
-                                _app_toolbin="$APPDIR/bin/tar"
-                        elif command -v tar >/dev/null 2>&1; then
-                                _app_toolbin="tar"
-                        elif [ "$USE_SHARED_WINE_APPIMAGE" = 1 ] && [ "$_app_wine_bin" != "$APPDIR/bin/wine" ]; then
-                                _app_toolbin="$_app_wine_bin"
-                                _app_toolsub="tar"
-                        else
-                                echo "No tar found (checked shared wine.AppImage and \$PATH) to extract $_pkg_file" >&2
-                                return 1
-                        fi
-                        mkdir -p "$WINEPREFIX/drive_c/$_APP_NAME"
-                        if [ -n "$_app_toolsub" ]; then
-                                "$_app_toolbin" "$_app_toolsub" -xJf "$_pkg_file" -C "$WINEPREFIX/drive_c/$_APP_NAME" || return 1
-                        else
-                                "$_app_toolbin" -xJf "$_pkg_file" -C "$WINEPREFIX/drive_c/$_APP_NAME" || return 1
-                        fi
-                        ;;
-                *.tar.gz|*.tgz)
-						# Resolution order: $APPDIR/bin, host $PATH, then shared
-						# wine.AppImage last (same as wget/unzip/7z).
-                        _app_toolbin=""
-                        _app_toolsub=""
-                        if [ -x "$APPDIR/bin/tar" ]; then
-                                _app_toolbin="$APPDIR/bin/tar"
-                        elif command -v tar >/dev/null 2>&1; then
-                                _app_toolbin="tar"
-                        elif [ "$USE_SHARED_WINE_APPIMAGE" = 1 ] && [ "$_app_wine_bin" != "$APPDIR/bin/wine" ]; then
-                                _app_toolbin="$_app_wine_bin"
-                                _app_toolsub="tar"
-                        else
-                                echo "No tar found (checked shared wine.AppImage and \$PATH) to extract $_pkg_file" >&2
-                                return 1
-                        fi
-                        mkdir -p "$WINEPREFIX/drive_c/$_APP_NAME"
-                        if [ -n "$_app_toolsub" ]; then
-                                "$_app_toolbin" "$_app_toolsub" -xzf "$_pkg_file" -C "$WINEPREFIX/drive_c/$_APP_NAME" || return 1
-                        else
-                                "$_app_toolbin" -xzf "$_pkg_file" -C "$WINEPREFIX/drive_c/$_APP_NAME" || return 1
-                        fi
-                        ;;
-                *.7z)
-						# Resolution order: $APPDIR/bin, host $PATH, then shared
-						# wine.AppImage last. Some wine-AppImage builds
-						# often omit bin/7z; routing there first made AppRun
-						# fall through to "wine 7z …" and skip the extract.
-                        _app_toolbin=""
-                        _app_toolsub=""
-                        if [ -x "$APPDIR/bin/7z" ]; then
-                                _app_toolbin="$APPDIR/bin/7z"
-                        elif command -v 7z >/dev/null 2>&1; then
-                                _app_toolbin="7z"
-                        elif [ "$USE_SHARED_WINE_APPIMAGE" = 1 ] && [ "$_app_wine_bin" != "$APPDIR/bin/wine" ]; then
-                                _app_toolbin="$_app_wine_bin"
-                                _app_toolsub="7z"
-                        else
-                                echo "No 7z found (checked $APPDIR/bin, \$PATH, and shared wine.AppImage) to extract $_pkg_file" >&2
-                                return 1
-                        fi
-                        mkdir -p "$WINEPREFIX/drive_c/$_APP_NAME"
-                        if [ -n "$_app_toolsub" ]; then
-                                "$_app_toolbin" "$_app_toolsub" x -o"$WINEPREFIX/drive_c/$_APP_NAME" -y "$_pkg_file" >/dev/null || return 1
-                        else
-                                "$_app_toolbin" x -o"$WINEPREFIX/drive_c/$_APP_NAME" -y "$_pkg_file" >/dev/null || return 1
-                        fi
-                        ;;
-                *.msi)
-                        "$WINELOADER" msiexec /i "$_pkg_file" /qn /norestart || return 1
-                        ;;
-                *.exe)
-                        # Most NSIS/Inno installers accept /S (NSIS) or /VERYSILENT
-                        # (Inno) for unattended install. Adjust per-app if the
-                        # installer uses a different silent flag — check with
-                        # `wine installer.exe /?` or the app's own docs.
-                        "$WINELOADER" "$_pkg_file" /S /VERYSILENT /SUPPRESSMSGBOXES /NORESTART || return 1
-                        ;;
-                *)
-                        echo "Unrecognized installer type: $_pkg_file" >&2
-                        [ "$_pkg_is_local" = 0 ] && rm -f "$_pkg_file"
-                        return 1
-                        ;;
-        esac
+	# Extract archives to temp, then flatten a single top-level folder
+	case "$_pkg_file" in
+		*.zip|*.tar.xz|*.txz|*.tar.gz|*.tgz|*.7z)
+			_pkg_tmp="$CACHEDIR/$_APP_NAME-extract-$$"
+			rm -rf "$_pkg_tmp"
+			mkdir -p "$_pkg_tmp"
 
-        # Only remove a downloaded temp file — never delete a bundled
-        # payload living inside the read-only AppImage mount (harmless no-op
-        # if attempted, but the intent is clearer this way).
-        [ "$_pkg_is_local" = 0 ] && rm -f "$_pkg_file"
+			case "$_pkg_file" in
+				*.zip)
+					command -v unzip >/dev/null 2>&1 || {
+						echo "No unzip found to extract $_pkg_file" >&2; return 1
+					}
+					unzip -q -o "$_pkg_file" -d "$_pkg_tmp" || return 1
+					;;
+				*.tar.xz|*.txz|*.tar.gz|*.tgz)
+					command -v tar >/dev/null 2>&1 || {
+						echo "No tar found to extract $_pkg_file" >&2; return 1
+					}
+					case "$_pkg_file" in
+						*.tar.xz|*.txz) tar -xJf "$_pkg_file" -C "$_pkg_tmp" || return 1 ;;
+						*)              tar -xzf "$_pkg_file" -C "$_pkg_tmp" || return 1 ;;
+					esac
+					;;
+				*.7z)
+					command -v 7z >/dev/null 2>&1 || {
+						echo "No 7z found to extract $_pkg_file" >&2; return 1
+					}
+					7z x -o"$_pkg_tmp" -y "$_pkg_file" >/dev/null || return 1
+					;;
+			esac
 
-        # Remove Windows .lnk shortcuts WineMenuBuilder drops on the desktop —
-        # they don't work in Linux and just confuse users.
-        # Only .exe and .msi installers trigger WineMenuBuilder; zip/tar/7z do not.
-        case "$_pkg_file" in *.exe|*.msi)
-                _desktop_dir="$(xdg-user-dir DESKTOP 2>&3)"
-                [ -n "$_desktop_dir" ] && find "$_desktop_dir" -maxdepth 1 -name '*.lnk' -delete 2>&3 || true
-        esac
+			# Count items at root of extraction
+			_pkg_items=$(find "$_pkg_tmp" -maxdepth 1 -mindepth 1 | wc -l | tr -d ' ')
+			_pkg_dirs=$(find "$_pkg_tmp" -maxdepth 1 -mindepth 1 -type d | wc -l | tr -d ' ')
+			_pkg_files=$(find "$_pkg_tmp" -maxdepth 1 -mindepth 1 -type f | wc -l | tr -d ' ')
+
+			mkdir -p "$_pkg_dest"
+
+			if [ "$_pkg_items" -eq 1 ] && [ "$_pkg_dirs" -eq 1 ] && [ "$_pkg_files" -eq 0 ]; then
+				# Exactly one directory at root, no files — flatten it
+				_pkg_inner=$(find "$_pkg_tmp" -maxdepth 1 -mindepth 1 -type d | head -n 1)
+				mv "$_pkg_inner"/* "$_pkg_dest/" 2>/dev/null || true
+				mv "$_pkg_inner"/.[!.]* "$_pkg_dest/" 2>/dev/null || true
+				rmdir "$_pkg_inner" 2>/dev/null || true
+			else
+				mv "$_pkg_tmp"/* "$_pkg_dest/" 2>/dev/null || true
+				mv "$_pkg_tmp"/.[!.]* "$_pkg_dest/" 2>/dev/null || true
+			fi
+			rm -rf "$_pkg_tmp"
+			;;
+		*.msi)
+			_inst_flags="${INSTALL_FLAGS:-/qn /norestart}"
+			# shellcheck disable=SC2086 — intentional word-split of flags
+			DISABLE_AUTO_UPDATES=1 "$WINELOADER" msiexec /i "$_pkg_file" $_inst_flags || return 1
+			;;
+		*.exe)
+			_inst_flags="${INSTALL_FLAGS:-/S /VERYSILENT /SUPPRESSMSGBOXES /NORESTART}"
+			# shellcheck disable=SC2086 — intentional word-split of flags
+			DISABLE_AUTO_UPDATES=1 "$WINELOADER" "$_pkg_file" $_inst_flags || return 1
+			;;
+		*)
+			echo "Unrecognized installer type: $_pkg_file" >&2
+			[ "$_pkg_is_local" = 0 ] && rm -f "$_pkg_file"
+			return 1
+			;;
+	esac
+
+	[ "$_pkg_is_local" = 0 ] && rm -f "$_pkg_file"
+
+	case "$_pkg_file" in
+		*.exe|*.msi)
+			_desktop_dir="$(xdg-user-dir DESKTOP 2>&3)"
+			# Only remove .lnk files matching our app name
+			if [ -n "$_desktop_dir" ] && [ -n "$_APP_NAME" ]; then
+				find "$_desktop_dir" -maxdepth 1 -name "*${_APP_NAME}*.lnk" -delete 2>&3 || true
+			fi
+			;;
+	esac
+}
+
+_app_winpath_to_unix() {
+	_wp="$1"
+	case "$_wp" in
+		/*) printf '%s\n' "$_wp" ;;
+		[A-Za-z]:*)
+			_drive=$(printf '%s' "${_wp%"${_wp#?}"}" | tr 'A-Z' 'a-z')
+			_rest=$(printf '%s' "${_wp#??}" | tr '\\' '/')
+			printf '%s\n' "$WINEPREFIX/drive_${_drive}${_rest}"
+			;;
+		*) printf '%s\n' "$WINEPREFIX/drive_c/$(printf '%s' "$_wp" | tr '\\' '/')" ;;
+	esac
 }
 
 if [ -n "$INSTALL_URL" ] && [ -n "$RUN_EXE" ]; then
-        # Resolve RUN_EXE (may be given as a Windows path) to a unix path to
-        # check whether the app is already installed.
-        case "$RUN_EXE" in
-                /*) _run_exe_unix="$RUN_EXE" ;;
-                *)  _run_exe_unix=$("$WINELOADER" winepath -u "$RUN_EXE" 2>&3 || echo "$RUN_EXE") ;;
-        esac
+	_run_exe_unix="$(_app_winpath_to_unix "$RUN_EXE")"
+	_installed_ver_file="$_APP_HOME/.installed_version"
+	_need_install=0
+	# Case-insensitive check for exe on Linux filesystems
+	if [ ! -f "$_run_exe_unix" ] && ! _app_ci_exists "$_run_exe_unix"; then
+		_need_install=1
+	elif [ ! -f "$_installed_ver_file" ] || [ "$(cat "$_installed_ver_file" 2>&3)" != "$_APP_VER" ]; then
+		_need_install=1
+	fi
 
-        # Reinstall whenever the target exe is missing, or the app version
-        # changed since the last recorded install.
-        _installed_ver_file="$_APP_HOME/.installed_version"
-        _need_install=0
-        [ -f "$_run_exe_unix" ] || _need_install=1
-        if [ -f "$_installed_ver_file" ] && [ "$(cat "$_installed_ver_file")" != "$_APP_VER" ]; then
-                _need_install=1
-        fi
-
-        if [ "$_need_install" = 1 ]; then
-                echo "Installing $_APP_NAME..." 2>&3
-                _app_install_payload "$INSTALL_URL" \
-                        && echo "$_APP_VER" > "$_installed_ver_file"
-        fi
+	if [ "$_need_install" = 1 ]; then
+		echo "Installing $_APP_NAME..." 2>&3
+		# Only stamp version when the expected exe is actually present
+		if _app_install_payload "$INSTALL_URL"; then
+			if [ -f "$_run_exe_unix" ] || _app_ci_exists "$_run_exe_unix"; then
+				echo "$_APP_VER" > "$_installed_ver_file"
+			else
+				echo "WARN: install finished but $RUN_EXE not found under prefix" >&2
+			fi
+		fi
+	fi
+	unset _run_exe_unix _installed_ver_file _need_install
 fi
 
-# Translate host file paths to Wine paths.
-# Uses shift-and-count to avoid eval and preserve paths with spaces.
-_app_argc=$#
-while [ "$_app_argc" -gt 0 ]; do
-        _app_arg="$1"; shift; _app_argc=$((_app_argc - 1))
-        if [ -e "$_app_arg" ]; then
-                set -- "$@" "$("$_app_wine_bin" winepath -w "$_app_arg")"
-        else
-                set -- "$@" "$_app_arg"
-        fi
-done
+# Translate existing host paths to Wine paths. Absolute paths use the default
+# Z:\ mapping (no wine process). Relative/odd paths fall back to winepath.
+if [ "$#" -gt 0 ]; then
+	_app_argc=$#
+	while [ "$_app_argc" -gt 0 ]; do
+		_app_arg="$1"; shift; _app_argc=$((_app_argc - 1))
+		if [ -e "$_app_arg" ]; then
+			case "$_app_arg" in
+				/*)
+					# Z: → /  (Wine default). Avoid spawning wine-AppImage per arg.
+					_app_wp=$(printf 'Z:%s' "$_app_arg" | sed 's|/|\\|g')
+					set -- "$@" "$_app_wp"
+					;;
+				*)
+					set -- "$@" "$(DISABLE_AUTO_UPDATES=1 "$WINELOADER" winepath -w "$_app_arg")"
+					;;
+			esac
+		else
+			set -- "$@" "$_app_arg"
+		fi
+	done
+fi

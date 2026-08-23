@@ -1,0 +1,222 @@
+#!/bin/sh
+
+# get-wine-appimage.hook — sourced by AppRun before APPNAME.hook
+# Fast path: cache / existing symlink (no PATH walk, no --wine-appimage).
+# Slow path: PATH scan → anylinux name → --wine-appimage → download.
+# Note: AppRun uses set -e — every cat/readlink must tolerate failure.
+
+_denyfile=$CACHEDIR/.no-wine-appimage-${APPIMAGE##*/}
+# Layout under $DATADIR/wine-appimage/:
+#   bin/          tool wrappers (.run, wine, 7z, …)
+#   apps/APPNAME/ per-app data (prefix, synced payload) — set by APPNAME.hook
+#   wine-*.AppImage  downloaded shared runtime
+#   .target       single cache of the resolved AppImage path
+_WINE_ROOT="$DATADIR/wine-appimage"
+_WINE_TOOLS_DIR="$_WINE_ROOT/bin"
+_WINE_TARGET_FILE="$_WINE_ROOT/.target"
+
+_wine_message="${APPIMAGE##*/} needs pkgforge-dev/wine-AppImage to run, but it is not installed on your system. Do you want to download and install it now? You can also install it manually from: https://github.com/pkgforge-dev/wine-AppImage"
+
+_is_anylinux_wine() {
+	case "$(basename "$1")" in
+		*anylinux*.AppImage) return 0 ;;
+		*) return 1 ;;
+	esac
+}
+
+# Prefer anylinux filename; only probe --wine-appimage when name is ambiguous.
+_wine_accept() {
+	_c="$1"
+	[ -x "$_c" ] || return 1
+	_is_anylinux_wine "$_c" && return 0
+	_probe_prefix="${CACHEDIR}/wine-appimage-probe-$$"
+	# DISABLE_AUTO_UPDATES: older wine-AppImages without 00-wine-appimage-flag.hook
+	# would otherwise run self-updater during the probe.
+	# WINEDLLOVERRIDES: suppress Wine Mono/Gecko install dialogs on probe.
+	WINEPREFIX="$_probe_prefix" \
+	DISABLE_AUTO_UPDATES=1 \
+	WINEDLLOVERRIDES="mscoree,mshtml=" \
+	WINEDEBUG="-all" \
+		"$_c" --wine-appimage >/dev/null 2>&1
+	_r=$?
+	rm -rf "$_probe_prefix"
+	[ "$_r" -eq 0 ]
+}
+
+_link_wine_tools() {
+	_wine_target="$1"
+	[ -d "$_WINE_TOOLS_DIR" ] || mkdir -p "$_WINE_TOOLS_DIR"
+	[ -d "$_WINE_ROOT" ] || mkdir -p "$_WINE_ROOT"
+
+	# Fast path: same target, runner + key links already present — no I/O.
+	_old_target=$(cat "$_WINE_TARGET_FILE" 2>/dev/null || true)
+	if [ "$_old_target" = "$_wine_target" ] \
+		&& [ -x "$_WINE_TOOLS_DIR/.run" ] \
+		&& [ -L "$_WINE_TOOLS_DIR/wine" ] \
+		&& [ -L "$_WINE_TOOLS_DIR/7z" ]; then
+		return 0
+	fi
+
+	if [ "$_old_target" != "$_wine_target" ]; then
+		printf '%s\n' "$_wine_target" > "$_WINE_TARGET_FILE"
+	fi
+
+	# Rewrite .run only when missing — avoid a disk write on every launch.
+	if [ ! -x "$_WINE_TOOLS_DIR/.run" ]; then
+		cat > "$_WINE_TOOLS_DIR/.run" << 'RUNEOF'
+#!/bin/sh
+# Wrapper for pkgforge-dev/wine-AppImage tools — do not export
+# DISABLE_AUTO_UPDATES to the parent consumer AppImage process.
+export DISABLE_AUTO_UPDATES=1
+_dir=$(CDPATH= cd -- "$(dirname "$0")" && pwd) || exit 127
+_real=$(cat "$_dir/../.target" 2>/dev/null) || exit 127
+[ -x "$_real" ] || exit 127
+_tool=$(basename "$0")
+case "$_tool" in
+	wine|wineserver)
+		exec "$_real" "$@"
+		;;
+	*)
+		exec "$_real" "$_tool" "$@"
+		;;
+esac
+RUNEOF
+		chmod +x "$_WINE_TOOLS_DIR/.run"
+	fi
+
+	for _tool in wine wineserver winepath winetricks \
+		regedit winecfg wineboot msiexec \
+		7z unzip cabextract; do
+		if [ -L "$_WINE_TOOLS_DIR/$_tool" ]; then
+			[ "$(readlink "$_WINE_TOOLS_DIR/$_tool" 2>/dev/null || true)" = ".run" ] && continue
+		fi
+		ln -sf .run "$_WINE_TOOLS_DIR/$_tool"
+	done
+}
+
+_wine_appimage_scan() {
+	if [ -n "${WINE_APPIMAGE_PATH:-}" ] && _wine_accept "$WINE_APPIMAGE_PATH"; then
+		printf '%s\n' "$WINE_APPIMAGE_PATH"
+		return 0
+	fi
+	_old_ifs=$IFS
+	IFS=:
+	for _p in $PATH; do
+		IFS=$_old_ifs
+		[ -n "$_p" ] || continue
+		for _name in wine wine.AppImage; do
+			[ -x "$_p/$_name" ] || continue
+			_cand=$_p/$_name
+			_real=$(readlink -f "$_cand" 2>/dev/null || true)
+			[ -n "$_real" ] || _real=$_cand
+			if _wine_accept "$_cand" || _wine_accept "$_real"; then
+				if [ -f "$_real" ] && _is_anylinux_wine "$_real"; then
+					printf '%s\n' "$_real"
+				else
+					printf '%s\n' "$_cand"
+				fi
+				return 0
+			fi
+		done
+		for _cand in "$_p"/wine*anylinux*.AppImage; do
+			[ -e "$_cand" ] || continue
+			[ -x "$_cand" ] || continue
+			if _wine_accept "$_cand"; then
+				printf '%s\n' "$_cand"
+				return 0
+			fi
+		done
+	done
+	IFS=$_old_ifs
+	return 1
+}
+
+_get_wine_appimage() {
+	mkdir -p "$_WINE_ROOT" "$_WINE_TOOLS_DIR"
+
+	_api_url="https://api.github.com/repos/pkgforge-dev/wine-AppImage/releases/latest"
+	_json=$(download - "$_api_url") || _json=""
+
+	if [ -z "$_json" ]; then
+		echo "ERROR: Failed to fetch wine-AppImage release info." >&2
+		echo "Please install it manually from:" >&2
+		echo "  https://github.com/pkgforge-dev/wine-AppImage/releases" >&2
+		return 1
+	fi
+
+	_wine_link=$(printf '%s' "$_json" | sed 's/[()",{} ]/\n/g' \
+		| grep -oi "https.*anylinux.*$APPIMAGE_ARCH.*AppImage" | head -n 1)
+
+	if [ -z "$_wine_link" ]; then
+		echo "ERROR: Could not find a wine-AppImage release asset for $APPIMAGE_ARCH." >&2
+		return 1
+	fi
+
+	_wine_basename=$(basename "${_wine_link%%\?*}")
+	>&2 echo "Downloading '$_wine_basename'..."
+
+	# Store the AppImage at wine-appimage root (not in bin/)
+	if ! download "$_WINE_ROOT/$_wine_basename" "$_wine_link"; then
+		return 1
+	fi
+
+	chmod +x "$_WINE_ROOT/$_wine_basename"
+
+	if ! _wine_accept "$_WINE_ROOT/$_wine_basename"; then
+		echo "ERROR: Downloaded file is not a usable wine-AppImage." >&2
+		rm -f "$_WINE_ROOT/$_wine_basename"
+		return 1
+	fi
+
+	WINE_APPIMAGE_PATH="$_WINE_ROOT/$_wine_basename"
+	export WINE_APPIMAGE_PATH
+	_link_wine_tools "$WINE_APPIMAGE_PATH"
+}
+
+# ── Main (fast path first) ─────────────────────────────────────────────
+_wine_path=""
+
+if [ -n "${WINE_APPIMAGE_PATH:-}" ] && [ -x "$WINE_APPIMAGE_PATH" ]; then
+	_wine_path="$WINE_APPIMAGE_PATH"
+elif [ -f "$_WINE_TARGET_FILE" ]; then
+	# || true: missing/empty must not abort under AppRun's set -e
+	_cand=$(cat "$_WINE_TARGET_FILE" 2>/dev/null || true)
+	[ -n "$_cand" ] && [ -x "$_cand" ] && _wine_path="$_cand"
+fi
+
+if [ -n "$_wine_path" ]; then
+	WINE_APPIMAGE_PATH="$_wine_path"
+	export WINE_APPIMAGE_PATH
+	case ":$PATH:" in
+		*":$_WINE_TOOLS_DIR:"*) ;;
+		*) export PATH="$_WINE_TOOLS_DIR:$PATH" ;;
+	esac
+	# Always ensure the full tool set exists (idempotent). .target is
+	# written inside _link_wine_tools — single cache file.
+	_link_wine_tools "$WINE_APPIMAGE_PATH"
+elif _wine_path=$(_wine_appimage_scan); then
+	WINE_APPIMAGE_PATH="$_wine_path"
+	export WINE_APPIMAGE_PATH
+	case ":$PATH:" in
+		*":$_WINE_TOOLS_DIR:"*) ;;
+		*) export PATH="$_WINE_TOOLS_DIR:$PATH" ;;
+	esac
+	_link_wine_tools "$WINE_APPIMAGE_PATH"
+elif [ ! -f "$_denyfile" ]; then
+	if notify -dq "$_wine_message"; then
+		_get_wine_appimage || notify -de 'Something went wrong downloading wine-AppImage'
+		case ":$PATH:" in
+			*":$_WINE_TOOLS_DIR:"*) ;;
+			*) export PATH="$_WINE_TOOLS_DIR:$PATH" ;;
+		esac
+	else
+		mkdir -p "$CACHEDIR"
+		: > "$_denyfile"
+	fi
+fi
+
+# Note: do NOT export DISABLE_AUTO_UPDATES here — that would also suppress
+# the consumer AppImage's own self-updater.hook. Tool wrappers under
+# $_WINE_TOOLS_DIR set it only for the wine-AppImage child process.
+
+unset _wine_path _cand _denyfile _wine_message _old_target
