@@ -82,10 +82,11 @@ All user-facing settings are at the top of `make-appimage.sh`. **Do not hand-edi
 | `RUN_EXE` | Windows-style path to installed exe. Required when `INSTALL_URL` is set. | *(empty)* |
 | `INSTALL_FLAGS` | Space-separated silent flags for runtime `.exe`/`.msi` installers. Empty → built-in defaults. Archives ignore this. | *(empty)* |
 | `TRICKS` | Space-separated [winetricks](https://github.com/Winetricks/winetricks) verbs. | *(empty)* |
-| `WINEDLLOVERRIDES` | Wine DLL override string. | `mscoree,mshtml=` |
+| `WINEDLLOVERRIDES` | Wine DLL override string. | `mscoree,mshtml=;winemenubuilder.exe=d` |
 | `WINEDEBUG` | Wine debug channel string. | `fixme-all` |
 | `WINEPREFIX_SUBDIR` | Prefix directory name under `$DATADIR/wine-appimage/apps/$APPNAME/`. | `.wine` |
 | `WINE_APPIMAGE_PATH` | Pin a specific wine-AppImage (env at runtime or document for users). | *(unset — auto-resolve)* |
+| `WINEPREFIX_DEDUP` | Share `system32`/`syswow64`/`winsxs`/`resources`/`globalization` (+ Wine Mono trees if installed) via template prefix. | `1` (on) |
 | `GENERIC_NAME` | `GenericName=` in desktop file. | `Wine Application` |
 | `COMMENT_NAME` | `Comment=` in desktop file. | `Wine-packaged Windows application` |
 | `CATEGORIES_NAME` | `Categories=` in desktop file. | `Utility;` |
@@ -193,6 +194,7 @@ After first run (prefix + tricks + install done), a normal start should avoid:
 | `winepath` for absolute file args | Shell `Z:\\` mapping (covers `/media`, `/mnt`, …) |
 | Re-downloading the same installer URL | Reuse non-empty file in `$CACHEDIR` |
 | Winetricks / wineboot | Gated by `.tricks-applied` / `system.reg` |
+| Full per-app `system32` copy | Dedup symlinks after wineboot (`.deduped`) |
 
 Relative file args still call `winepath` (one wine-AppImage start). Meta-verbs like `corefonts` remain slow on **first** run even with a warm download cache (per-font Wine registration).
 
@@ -294,6 +296,7 @@ Everything for the shared Wine runtime and consumer apps lives under `$XDG_DATA_
 
 ```text
 $XDG_DATA_HOME/wine-appimage/
+├── .template-prefix/            # shared system32/syswow64/winsxs (dedup)
 ├── .target                      # cached path to the resolved wine-*.AppImage
 ├── wine-*-anylinux-*.AppImage   # downloaded shared runtime (optional location)
 ├── bin/                         # tool wrappers → wine, winetricks, 7z, unzip, …
@@ -317,6 +320,7 @@ $XDG_DATA_HOME/wine-appimage/
 | **App home** | Synced payload, `.synced-version` | `$XDG_DATA_HOME/wine-appimage/apps/$APPNAME/` |
 | **Wine prefix** | Registry, system DLLs, `drive_c` | `$XDG_DATA_HOME/wine-appimage/apps/$APPNAME/.wine` |
 | **App user data** | Settings, saves via AppData redirect | `$XDG_DATA_HOME/wine-appimage/data/$APPNAME/` |
+| **Template prefix** | Shared `system32` / `syswow64` / `winsxs` for dedup | `$XDG_DATA_HOME/wine-appimage/.template-prefix/.wine` |
 
 ### AppData Redirect (enabled by default)
 
@@ -335,6 +339,35 @@ redirect target exists but the app has not written there yet.
 **To disable:** set `REDIRECT_APPDATA=0` (env or in the hook).
 
 > **Caution:** Some older installers hardcode `drive_c` paths. Disable if installation breaks.
+
+---
+
+### Prefix deduplication (enabled by default)
+
+After `wineboot --init`, large **static** Wine trees are replaced with symlinks
+into a shared template prefix:
+
+| Shared (symlink → template) | Kept local per app |
+|-----------------------------|--------------------|
+| `drive_c/windows/system32` | `Fonts`, `temp`, `inf`, … |
+| `drive_c/windows/syswow64` | `user.reg`, `system.reg` |
+| `drive_c/windows/winsxs` | `drive_c/users/`, Program Files, app dirs |
+| `drive_c/windows/resources` | themes / aero, etc. |
+| `drive_c/windows/globalization` | sorting / NLS data |
+| `mono`, `Microsoft.NET`, `assembly` (if present) | — only when Mono was installed into the template |
+
+**Order:** ensure template → app `wineboot` → replace the three dirs with symlinks.
+
+- Template dir keeps **only** those three trees (everything else from template `wineboot` is deleted)
+- Template path: `$XDG_DATA_HOME/wine-appimage/.template-prefix/.wine`
+- Per-app stamp: `$WINEPREFIX/.deduped` (skip work on later launches)
+- Fast path when template stamp matches current `WINE_APPIMAGE_PATH`
+- Typical savings: **~300–500 MB per app** after the first prefix
+- Disable: `WINEPREFIX_DEDUP=0` in `make-appimage.sh` or env (default **on**)
+
+Template `wineboot` uses the app’s `WINEDLLOVERRIDES` (`mscoree=` Mono, `mshtml=` Gecko, `winemenubuilder.exe=d` by default — change in `make-appimage.sh`). Template init still appends `winemenubuilder.exe=d` if missing. If Mono is allowed (`mscoree` not disabled) and installed, `mono` / `Microsoft.NET` / `assembly` are kept in the template and shared.
+
+> **Note:** Writes into linked dirs (e.g. some winetricks that drop DLLs into `system32`) affect the **shared** template. Fonts and user data stay private.
 
 ---
 
@@ -452,7 +485,7 @@ export WINE_APPIMAGE_PATH="$HOME/Applications/wine-11.15-1-anylinux-x86_64.AppIm
 **Ambiguous PATH names** (not matching `*anylinux*`) are probed with
 `… --wine-appimage` under a temporary `WINEPREFIX`, with:
 - `DISABLE_AUTO_UPDATES=1` — skip wine-AppImage self-updater during probe
-- `WINEDLLOVERRIDES=mscoree,mshtml=` — suppress Wine Mono/Gecko install dialogs
+- Default `WINEDLLOVERRIDES` — `mscoree=` Mono, `mshtml=` Gecko, `winemenubuilder.exe=d` (editable in `make-appimage.sh`)
 - `WINEDEBUG=-all`
 
 Files already named `*anylinux*.AppImage` are accepted by name only (no probe).

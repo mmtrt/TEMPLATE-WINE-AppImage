@@ -152,12 +152,132 @@ EOF
 	update-desktop-database -q 2>&3 || true
 fi
 
+# ---------------------------------------------------------------------------
+# Prefix dedup — order: ensure template → app wineboot → symlink trees
+#
+# Always shared when present: system32, syswow64, winsxs
+# Also shared when Wine Mono was installed into the template:
+#   mono, Microsoft.NET, assembly  (only if mscoree is NOT disabled)
+#
+# Template wineboot uses the app's WINEDLLOVERRIDES (from make-appimage.sh /
+# env): mscoree= disables Mono, mshtml= disables Gecko. If mscoree is
+# disabled, Mono dirs will not exist. winemenubuilder.exe=d is added only
+# for the template init so menu-builder cannot hang that one-time wineboot.
+#
+# Default on — disable with WINEPREFIX_DEDUP=0 in make-appimage.sh or env.
+# ---------------------------------------------------------------------------
+WINEPREFIX_DEDUP="${WINEPREFIX_DEDUP:-WINEPREFIX_DEDUP_HERE}"
+
+_wineprefix_ensure_template() {
+	[ "$WINEPREFIX_DEDUP" = 1 ] || return 0
+
+	_tpl_root="$DATADIR/wine-appimage/.template-prefix"
+	_tpl_prefix="$_tpl_root/.wine"
+	_tpl_stamp="$_tpl_root/.wine-id"
+	_tpl_ready="$_tpl_prefix/drive_c/windows/system32"
+	# Rebuild when wine binary OR overrides change (mono on vs off)
+	_wine_id="${WINE_APPIMAGE_PATH:-$WINELOADER}|${WINEDLLOVERRIDES}"
+
+	if [ -d "$_tpl_ready" ] \
+		&& [ -f "$_tpl_stamp" ] \
+		&& [ "$(cat "$_tpl_stamp" 2>/dev/null || true)" = "$_wine_id" ]; then
+		unset _tpl_root _tpl_prefix _tpl_stamp _tpl_ready _wine_id
+		return 0
+	fi
+
+	rm -rf "$_tpl_root"
+	mkdir -p "$_tpl_prefix"
+
+	# App overrides + winemenubuilder only for this template wineboot
+	_tpl_ov="${WINEDLLOVERRIDES}"
+	case ";$_tpl_ov;" in
+		*winemenubuilder*) ;;
+		*) _tpl_ov="${_tpl_ov};winemenubuilder.exe=d" ;;
+	esac
+
+	WINEPREFIX="$_tpl_prefix" \
+	WINEDLLOVERRIDES="$_tpl_ov" \
+	WINEDEBUG="-all" \
+	DISABLE_AUTO_UPDATES=1 \
+		"$WINELOADER" wineboot --init 2>&3 || true
+	WINEPREFIX="$_tpl_prefix" DISABLE_AUTO_UPDATES=1 \
+		"$WINELOADER" wineserver -w 2>&3 || true
+
+	# Keep static system trees + Wine Mono trees when present
+	_win="$_tpl_prefix/drive_c/windows"
+	if [ -d "$_win" ]; then
+		for _entry in "$_win"/*; do
+			[ -e "$_entry" ] || continue
+			case "$(basename "$_entry")" in
+				system32|syswow64|winsxs|resources|globalization|mono|Microsoft.NET|assembly) ;;
+				*) rm -rf "$_entry" ;;
+			esac
+		done
+	fi
+	for _entry in "$_tpl_prefix"/* "$_tpl_prefix"/.[!.]*; do
+		[ -e "$_entry" ] || continue
+		case "$(basename "$_entry")" in
+			drive_c) ;;
+			*) rm -rf "$_entry" ;;
+		esac
+	done
+	if [ -d "$_tpl_prefix/drive_c" ]; then
+		for _entry in "$_tpl_prefix/drive_c"/*; do
+			[ -e "$_entry" ] || continue
+			case "$(basename "$_entry")" in
+				windows) ;;
+				*) rm -rf "$_entry" ;;
+			esac
+		done
+	fi
+
+	if [ ! -d "$_tpl_ready" ]; then
+		echo "WARN: prefix template missing system32 — dedup skipped" >&2
+		rm -rf "$_tpl_root"
+		unset _tpl_root _tpl_prefix _tpl_stamp _tpl_ready _wine_id _tpl_ov _win _entry
+		return 1
+	fi
+	printf '%s\n' "$_wine_id" > "$_tpl_stamp"
+	unset _tpl_root _tpl_prefix _tpl_stamp _tpl_ready _wine_id _tpl_ov _win _entry
+	return 0
+}
+
+_wineprefix_dedup_symlink() {
+	_dedup_prefix="${1:-$WINEPREFIX}"
+	[ "$WINEPREFIX_DEDUP" = 1 ] || return 0
+	[ -d "$_dedup_prefix/drive_c/windows" ] || return 0
+	[ -f "$_dedup_prefix/.deduped" ] && return 0
+
+	_tpl_prefix="$DATADIR/wine-appimage/.template-prefix/.wine"
+	[ -d "$_tpl_prefix/drive_c/windows/system32" ] || return 1
+
+	# system32/syswow64/winsxs/resources/globalization always; mono trees if present
+	for _sub in system32 syswow64 winsxs resources globalization mono Microsoft.NET assembly; do
+		_src="$_tpl_prefix/drive_c/windows/$_sub"
+		_dst="$_dedup_prefix/drive_c/windows/$_sub"
+		[ -d "$_src" ] || continue
+		if [ -L "$_dst" ] && [ "$(readlink "$_dst" 2>/dev/null || true)" = "$_src" ]; then
+			continue
+		fi
+		rm -rf "$_dst"
+		ln -s "$_src" "$_dst" || true
+	done
+
+	: > "$_dedup_prefix/.deduped"
+	unset _dedup_prefix _tpl_prefix _sub _src _dst
+}
+
+# 1) Template first (shared trees), 2) app prefix, 3) link
+_wineprefix_ensure_template
+
 _app_fresh_prefix=0
 if [ ! -f "$WINEPREFIX/system.reg" ]; then
 	DISABLE_AUTO_UPDATES=1 "$WINELOADER" wineboot --init 2>&3
 	DISABLE_AUTO_UPDATES=1 "$WINELOADER" wineserver -w 2>&3 || true
 	_app_fresh_prefix=1
 fi
+
+_wineprefix_dedup_symlink "$WINEPREFIX"
 
 # AppData redirect: symlink each profile's AppData to
 # $DATADIR/wine-appimage/data/$APPNAME/AppData so settings survive prefix

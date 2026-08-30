@@ -53,8 +53,19 @@ TRICKS=
 # something different (e.g. WINEDLLOVERRIDES to disable a misbehaving DLL,
 # WINEDEBUG to trace calls during development). Both stay overridable at
 # runtime via env regardless of what's set here.
-WINEDLLOVERRIDES="mscoree,mshtml="
+#   mscoree=              — disable Wine Mono
+#   mshtml=               — disable Wine Gecko
+#   winemenubuilder.exe=d — avoid menu-builder hangs under AppImage
+WINEDLLOVERRIDES="mscoree,mshtml=;winemenubuilder.exe=d"
 WINEDEBUG="fixme-all"
+
+# Share system32/syswow64/winsxs (and Wine Mono trees if Mono was installed)
+# across apps via a slim template prefix. Default on — set to 0 to disable.
+# Template wineboot uses WINEDLLOVERRIDES above:
+#   mscoree=  — disable Wine Mono
+#   mshtml=   — disable Wine Gecko
+# Drop mscoree= if you want Mono installed and shared in the template.
+WINEPREFIX_DEDUP=1
 
 # WINEPREFIX defaults to $DATADIR/wine-appimage/apps/$APPNAME/$WINEPREFIX_SUBDIR
 # (DATADIR is typically ~/.local/share). Change the value below if you need
@@ -188,6 +199,7 @@ sed -i "s|TRICKS_HERE|${TRICKS}|" "AppDir/bin/${APPNAME}.hook"
 sed -i "s|WINEDLLOVERRIDES_HERE|${WINEDLLOVERRIDES}|" "AppDir/bin/${APPNAME}.hook"
 sed -i "s|WINEDEBUG_HERE|${WINEDEBUG}|" "AppDir/bin/${APPNAME}.hook"
 sed -i "s|WINEPREFIX_SUBDIR_HERE|${WINEPREFIX_SUBDIR}|" "AppDir/bin/${APPNAME}.hook"
+sed -i "s|WINEPREFIX_DEDUP_HERE|${WINEPREFIX_DEDUP}|" "AppDir/bin/${APPNAME}.hook"
 # Convert the literal "AppDir" marker in INSTALL_URL to "$APPDIR"
 sed -i 's|INSTALL_URL:-AppDir/|INSTALL_URL:-$APPDIR/|' "AppDir/bin/${APPNAME}.hook"
 
