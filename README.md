@@ -7,7 +7,7 @@
 [![Latest Stable Release](https://img.shields.io/github/v/release/pkgforge-dev/TEMPLATE-WINE-AppImage)](https://github.com/pkgforge-dev/TEMPLATE-WINE-AppImage/releases/latest)
 
 <p align="center">
-  <img src="https://github.com/pkgforge-dev.png" width="128" />
+  <img src="AppDir/APPNAME.svg" width="128" />
 </p>
 
 

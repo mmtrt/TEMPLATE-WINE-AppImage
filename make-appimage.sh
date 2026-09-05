@@ -9,11 +9,8 @@ export OUTPATH=./dist
 export ADD_HOOKS="self-updater.hook"
 export UPINFO="gh-releases-zsync|${GITHUB_REPOSITORY%/*}|${GITHUB_REPOSITORY#*/}|latest|*$ARCH.AppImage.zsync"
 export APPNAME=APPNAME_HERE # change the application name here
-# ICON must match whichever icon file you actually provide (.png or .svg) —
-# this template ships an APPNAME.svg placeholder; change the extension here
-# if you're using a PNG instead.
-export ICON="${APPNAME}.svg"
-export DESKTOP="${APPNAME}.desktop"
+# Desktop + icon live under AppDir/ (AppDir/APPNAME.desktop, AppDir/APPNAME.svg|.png).
+# quick-sharun picks them up automatically — no DESKTOP/ICON env needed.
 # MAIN_EXE is always required — the .exe filename identifying your app.
 # Used for StartupWMClass (window matching) regardless of which payload
 # strategy you use, and as the launcher's fallback search target when
@@ -139,21 +136,30 @@ MIMETYPES_NAME="" # example: audio/aac;audio/x-mp3;
 # cp "payload/MyApp-Setup.exe" "AppDir/share/MyApp-Setup.exe"
 # # Then in APPNAME.hook: INSTALL_URL="$APPDIR/share/MyApp-Setup.exe"
 
-# App hook + thin launcher
-# Copy and rename the template hook/launcher for your app, then patch in
-# the version and app name. See AppDir/bin/APPNAME.hook and AppDir/bin/APPNAME
-# in this template for the reusable pattern (env setup, install/remove).
-# AppDir/bin/00-get-wine-appimage.hook is already in the tree — do not remove it.
+# App assets already live under AppDir/ (same layout as other pkgforge templates):
+#   AppDir/bin/APPNAME.hook   AppDir/bin/APPNAME
+#   AppDir/APPNAME.desktop    AppDir/APPNAME.svg|.png
+#   AppDir/bin/00-get-wine-appimage.hook  — shared wine resolver; do not remove
+# Rename placeholders to the real APPNAME, then patch in place.
 mkdir -p "AppDir/bin"
-cp APPNAME.hook "AppDir/bin/${APPNAME}.hook" && rm APPNAME.hook
-cp APPNAME "AppDir/bin/${APPNAME}" && rm APPNAME
-cp APPNAME.desktop "${APPNAME}.desktop" && rm APPNAME.desktop
-[ -f "APPNAME.svg" ] && cp APPNAME.svg "${APPNAME}.svg" && rm APPNAME.svg
-[ -f "APPNAME.png" ] && cp APPNAME.png "${APPNAME}.png" && rm APPNAME.png
+if [ -f "AppDir/bin/APPNAME.hook" ] && [ "$APPNAME" != "APPNAME" ]; then
+	mv "AppDir/bin/APPNAME.hook" "AppDir/bin/${APPNAME}.hook"
+fi
+if [ -f "AppDir/bin/APPNAME" ] && [ "$APPNAME" != "APPNAME" ]; then
+	mv "AppDir/bin/APPNAME" "AppDir/bin/${APPNAME}"
+fi
+if [ -f "AppDir/APPNAME.desktop" ] && [ "$APPNAME" != "APPNAME" ]; then
+	mv "AppDir/APPNAME.desktop" "AppDir/${APPNAME}.desktop"
+fi
+if [ -f "AppDir/APPNAME.svg" ] && [ "$APPNAME" != "APPNAME" ]; then
+	mv "AppDir/APPNAME.svg" "AppDir/${APPNAME}.svg"
+fi
+if [ -f "AppDir/APPNAME.png" ] && [ "$APPNAME" != "APPNAME" ]; then
+	mv "AppDir/APPNAME.png" "AppDir/${APPNAME}.png"
+fi
 
 # Mark files exec
-chmod +x "AppDir/bin/${APPNAME}.hook" "AppDir/bin/${APPNAME}" "${APPNAME}.desktop"
-# get-hook ships executable in-repo; keep it runnable if perms were lost
+chmod +x "AppDir/bin/${APPNAME}.hook" "AppDir/bin/${APPNAME}"
 [ -f "AppDir/bin/00-get-wine-appimage.hook" ] && chmod +x "AppDir/bin/00-get-wine-appimage.hook"
 
 # Sanity check: INSTALL_URL and RUN_EXE only make sense set together — one
@@ -207,14 +213,14 @@ sed -i 's|INSTALL_URL:-AppDir/|INSTALL_URL:-$APPDIR/|' "AppDir/bin/${APPNAME}.ho
 sed -i "s|MAIN_EXE_HERE|${MAIN_EXE}|" "AppDir/bin/${APPNAME}"
 sed -i -z "s|APPNAME_HERE|${APPNAME}|1" "AppDir/bin/${APPNAME}"
 
-# Patch desktop file
-sed -i "s|MAIN_EXE_HERE|${MAIN_EXE}|" "${APPNAME}.desktop"
-sed -i "s|APPNAME|${APPNAME}|g" "${APPNAME}.desktop"
-sed -i "s|^Version=.*|Version=${VERSION}|" "${APPNAME}.desktop"
-sed -i "s|^GenericName=.*|GenericName=${GENERIC_NAME}|" "${APPNAME}.desktop"
-sed -i "s|^Comment=.*|Comment=${COMMENT_NAME}|" "${APPNAME}.desktop"
-sed -i "s|^Categories=.*|Categories=${CATEGORIES_NAME}|" "${APPNAME}.desktop"
-sed -i "s|^MimeType=.*|MimeType=${MIMETYPES_NAME}|" "${APPNAME}.desktop"
+# Patch desktop file (already under AppDir/; quick-sharun finds AppDir/*.desktop)
+sed -i "s|MAIN_EXE_HERE|${MAIN_EXE}|" "AppDir/${APPNAME}.desktop"
+sed -i "s|APPNAME|${APPNAME}|g" "AppDir/${APPNAME}.desktop"
+sed -i "s|^Version=.*|Version=${VERSION}|" "AppDir/${APPNAME}.desktop"
+sed -i "s|^GenericName=.*|GenericName=${GENERIC_NAME}|" "AppDir/${APPNAME}.desktop"
+sed -i "s|^Comment=.*|Comment=${COMMENT_NAME}|" "AppDir/${APPNAME}.desktop"
+sed -i "s|^Categories=.*|Categories=${CATEGORIES_NAME}|" "AppDir/${APPNAME}.desktop"
+sed -i "s|^MimeType=.*|MimeType=${MIMETYPES_NAME}|" "AppDir/${APPNAME}.desktop"
 
 # Deploy dependencies
 quick-sharun \
